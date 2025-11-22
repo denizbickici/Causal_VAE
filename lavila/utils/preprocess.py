@@ -9,32 +9,85 @@ import csv
 from lavila.models.tokenizer import MyBertTokenizer, MyDistilBertTokenizer, MyGPT2Tokenizer, SimpleTokenizer
 
 
-def generate_label_map(dataset):
+def generate_label_map(dataset, args):
     if dataset == 'ek100_cls':
-        print("Preprocess ek100 action label space")
-        vn_list = []
-        mapping_vn2narration = {}
-        for f in [
-            'datasets/EK100/epic-kitchens-100-annotations/EPIC_100_train.csv',
-            'datasets/EK100/epic-kitchens-100-annotations/EPIC_100_validation.csv',
-        ]:
-            csv_reader = csv.reader(open(f))
-            _ = next(csv_reader)  # skip the header
-            for row in csv_reader:
-                vn = '{}:{}'.format(int(row[10]), int(row[12]))
-                narration = row[8]
-                if vn not in vn_list:
-                    vn_list.append(vn)
-                if vn not in mapping_vn2narration:
-                    mapping_vn2narration[vn] = [narration]
-                else:
-                    mapping_vn2narration[vn].append(narration)
-                # mapping_vn2narration[vn] = [narration]
-        vn_list = sorted(vn_list)
-        print('# of action= {}'.format(len(vn_list)))
-        mapping_vn2act = {vn: i for i, vn in enumerate(vn_list)}
-        labels = [list(set(mapping_vn2narration[vn_list[i]])) for i in range(len(mapping_vn2act))]
-        print(labels[:5])
+        finetune_type = getattr(args, 'egtea_finetune_type', 'action')  # Use same arg name for consistency
+        
+        if finetune_type == 'verb':
+            print("Preprocess ek100 verb label space")
+            verb_list = []
+            mapping_verb2narration = {}
+            for f in [
+                '/home/dz/Projects/multi-modal_AR/data/EK/data/EPIC_100_train.csv',
+                '/home/dz/Projects/multi-modal_AR/data/EK/data/EPIC_100_validation.csv',
+            ]:
+                csv_reader = csv.reader(open(f))
+                _ = next(csv_reader)  # skip the header
+                for row in csv_reader:
+                    verb_class = int(row[10])
+                    verb_name = row[9]
+                    if verb_class not in verb_list:
+                        verb_list.append(verb_class)
+                    if verb_class not in mapping_verb2narration:
+                        mapping_verb2narration[verb_class] = []
+                    mapping_verb2narration[verb_class].append(verb_name)
+            
+            verb_list = sorted(verb_list)
+            print('# of verbs = {}'.format(len(verb_list)))
+            mapping_vn2act = {str(v): i for i, v in enumerate(verb_list)}
+            labels = [list(set(mapping_verb2narration[verb_list[i]])) for i in range(len(mapping_vn2act))]
+            print('First 5 verb labels:', labels[:5])
+            
+        elif finetune_type == 'noun':
+            print("Preprocess ek100 noun label space")
+            noun_list = []
+            mapping_noun2narration = {}
+            for f in [
+                '/home/dz/Projects/multi-modal_AR/data/EK/data/EPIC_100_train.csv',
+                '/home/dz/Projects/multi-modal_AR/data/EK/data/EPIC_100_validation.csv',
+            ]:
+                csv_reader = csv.reader(open(f))
+                _ = next(csv_reader)  # skip the header
+                for row in csv_reader:
+                    noun_class = int(row[12])
+                    noun_name = row[11]
+                    if noun_class not in noun_list:
+                        noun_list.append(noun_class)
+                    if noun_class not in mapping_noun2narration:
+                        mapping_noun2narration[noun_class] = []
+                    mapping_noun2narration[noun_class].append(noun_name)
+            
+            noun_list = sorted(noun_list)
+            print('# of nouns = {}'.format(len(noun_list)))
+            mapping_vn2act = {str(n): i for i, n in enumerate(noun_list)}
+            labels = [list(set(mapping_noun2narration[noun_list[i]])) for i in range(len(mapping_vn2act))]
+            print('First 5 noun labels:', labels[:5])
+            
+        else:  # action (default)
+            print("Preprocess ek100 action label space")
+            vn_list = []
+            mapping_vn2narration = {}
+            for f in [
+                '/home/dz/Projects/multi-modal_AR/data/EK/data/EPIC_100_train.csv',
+                '/home/dz/Projects/multi-modal_AR/data/EK/data/EPIC_100_validation.csv',
+            ]:
+                csv_reader = csv.reader(open(f))
+                _ = next(csv_reader)  # skip the header
+                for row in csv_reader:
+                    vn = '{}:{}'.format(int(row[10]), int(row[12]))
+                    narration = row[8]
+                    if vn not in vn_list:
+                        vn_list.append(vn)
+                    if vn not in mapping_vn2narration:
+                        mapping_vn2narration[vn] = [narration]
+                    else:
+                        mapping_vn2narration[vn].append(narration)
+                    # mapping_vn2narration[vn] = [narration]
+            vn_list = sorted(vn_list)
+            print('# of action= {}'.format(len(vn_list)))
+            mapping_vn2act = {vn: i for i, vn in enumerate(vn_list)}
+            labels = [list(set(mapping_vn2narration[vn_list[i]])) for i in range(len(mapping_vn2act))]
+            print(labels[:5])
     elif dataset == 'charades_ego':
         print("=> preprocessing charades_ego action label space")
         vn_list = []
@@ -51,7 +104,13 @@ def generate_label_map(dataset):
     elif dataset == 'egtea':
         print("=> preprocessing egtea action label space")
         labels = []
-        with open('datasets/EGTEA/action_idx.txt') as f:
+        if args.egtea_finetune_type == 'action':
+            txt_file = 'action_idx'
+        if args.egtea_finetune_type == 'verb':
+            txt_file = 'verb_idx'  
+        if args.egtea_finetune_type == 'noun':
+            txt_file = 'noun_idx'
+        with open('../data/EGTEA/raw/annotation/idx/'+txt_file+'.txt') as f: # action_idx 106 verb_idx 19 noun_idx 53
             for row in f:
                 row = row.strip()
                 narration = ' '.join(row.split(' ')[:-1])

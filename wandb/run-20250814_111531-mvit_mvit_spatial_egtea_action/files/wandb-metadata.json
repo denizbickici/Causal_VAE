@@ -1,0 +1,83 @@
+{
+  "os":  "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.35",
+  "python":  "CPython 3.9.23",
+  "startedAt":  "2025-08-14T09:15:31.319103Z",
+  "args":  [
+    "--dataset",
+    "egtea",
+    "--root",
+    "/mnt/j/video_clips/cropped_clips/",
+    "--metadata-train",
+    "../data/EGTEA/raw/annotation/split/train_split1.txt",
+    "--metadata-val",
+    "../data/EGTEA/raw/annotation/split/test_split1.txt",
+    "--output-dir",
+    "output_ckpt/mvit_mvit_spatial_egtea_action",
+    "--model-type",
+    "mvit_spatial",
+    "--egtea-finetune-type",
+    "action",
+    "--batch-size",
+    "8",
+    "--lr",
+    "3e-4",
+    "--wd",
+    "4e-5",
+    "--epochs",
+    "50",
+    "--warmup-epochs",
+    "5",
+    "--eval-freq",
+    "1",
+    "--save-freq",
+    "10",
+    "--num-clips",
+    "1",
+    "--num-crops",
+    "3",
+    "--clip-length",
+    "16",
+    "--clip-stride",
+    "2",
+    "--workers",
+    "4",
+    "--seed",
+    "42",
+    "--use-checkpoint",
+    "--wandb"
+  ],
+  "program":  "/home/dz/Projects/multi-modal_AR/LaViLa/main_train_mvit.py",
+  "codePath":  "main_train_mvit.py",
+  "codePathLocal":  "main_train_mvit.py",
+  "git":  {
+    "remote":  "https://github.com/facebookresearch/LaViLa.git",
+    "commit":  "8002b5ab0db31789b9897a0a9c36729099e21ad4"
+  },
+  "email":  "denizbickici@mailbox.org",
+  "root":  "/home/dz/Projects/multi-modal_AR/LaViLa",
+  "host":  "driftphonk",
+  "executable":  "/home/dz/miniconda3/envs/lavila/bin/python3.9",
+  "cpu_count":  6,
+  "cpu_count_logical":  12,
+  "gpu":  "NVIDIA GeForce RTX 5090",
+  "gpu_count":  1,
+  "disk":  {
+    "/":  {
+      "total":  "1081101176832",
+      "used":  "430579249152"
+    }
+  },
+  "memory":  {
+    "total":  "50515333120"
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA GeForce RTX 5090",
+      "memoryTotal":  "34190917632",
+      "architecture":  "Blackwell",
+      "uuid":  "GPU-d014d57e-b8b1-47e9-1a3e-c21a45a5075d"
+    }
+  ],
+  "cudaVersion":  "12.9",
+  "writerId":  "eb1795a0zefcqkl2fz3noc5dbh4lz06s"
+}

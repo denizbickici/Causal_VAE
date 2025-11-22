@@ -99,9 +99,12 @@ class VCLM_HF(nn.Module):
         output_decoder = self.text_decoder(text.contiguous(), encoder_hidden_states=image_tokens)
         text_tokens_logits = output_decoder.logits
         text_tokens_logits = rearrange(text_tokens_logits, 'b n c -> b c n')
+        hidden_states = output_decoder.hidden_states
+        #print('hidden_states', hidden_states.shape)
 
         return {'text_tokens_logits': text_tokens_logits,
-                'labels': labels}
+                'labels': labels,
+                'hidden_states': hidden_states,}
 
     def generate(self, image_tokens, tokenizer, target=None, max_text_length=77, top_k=None, top_p=None,
                  num_return_sequences=1, temperature=1.0, teacher_forcing=False, early_stopping=False):

@@ -92,9 +92,7 @@ def get_frame_ids(start_frame, end_frame, num_segments=32, jitter=True):
 
 
 def video_loader_by_frames(root, vid, frame_ids):
-    video_path = osp.join(root, vid)
-    # print(f"Loading video: {video_path}, frames: {len(frame_ids)}")  # Debug
-    vr = decord.VideoReader(video_path)
+    vr = decord.VideoReader(osp.join(root, vid))
     try:
         frames = vr.get_batch(frame_ids).asnumpy()
         frames = [torch.tensor(frame, dtype=torch.float32) for frame in frames]
@@ -164,6 +162,7 @@ class VideoCaptionDatasetBase(torch.utils.data.Dataset):
                         rows = rows[:100]  # Limit for mini dataset
                         print(f"Mini mode: Processing first {len(rows)} rows")
                     
+                    print(f"Processing {len(rows)} samples from {metadata.split('/')[-1]}...")
                     for row in tqdm(rows, desc="Processing metadata with timestamps"):
                         pid, vid = row[1:3]
                         # Use timestamps from columns 4 and 5
@@ -191,62 +190,39 @@ class VideoCaptionDatasetBase(torch.utils.data.Dataset):
                         end_frame = int(np.ceil(fps * end_timestamp))
                         
                         self.samples.append((vid_path, start_frame, end_frame, narration, verb, noun))
-            
-            elif mini_dataset:
-                print("MINI DATASET MODE: Using limited samples for quick testing")
-                # First pass: get unique videos from first N rows
-                max_samples = 100  # Process first 100 metadata rows
-                max_videos = 5     # Use only first 5 unique videos
-                
-                with open(metadata) as f:
-                    csv_reader = csv.reader(f)
-                    _ = next(csv_reader)  # skip the header
-                    
-                    unique_videos = []
-                    rows_to_process = []
-                    video_set = set()
-                    
-                    for i, row in enumerate(csv_reader):
-                        if i >= max_samples:
-                            break
-                        pid, vid = row[1:3]
-                        vid_path = osp.join(self.root, '{}/videos/{}.MP4'.format(pid, vid))
-                        if vid_path not in video_set:
-                            video_set.add(vid_path)
-                            unique_videos.append(vid_path)
-                            if len(unique_videos) >= max_videos:
-                                break
-                        if len(unique_videos) <= max_videos:
-                            rows_to_process.append(row)
-                
-                print(f"Mini mode: Loading {len(unique_videos)} videos, {len(rows_to_process)} samples")
-                
-                # Process only selected rows
-                self.samples = []
-                for row in tqdm(rows_to_process, desc="Processing metadata (mini)"):
-                    pid, vid = row[1:3]
-                    # Use frame numbers directly from CSV (columns 6 and 7)
-                    start_frame, end_frame = int(row[6]), int(row[7])
-                    narration = row[8]
-                    verb, noun = int(row[10]), int(row[12])
-                    vid_path = '{}/videos/{}.MP4'.format(pid, vid)
-                    self.samples.append((vid_path, start_frame, end_frame, narration, verb, noun))
             else:
                 # Frame-based loading (current approach, faster)
                 print("Loading Epic Kitchen 100 dataset - using FRAME NUMBERS from CSV")
+                
                 self.samples = []
-                print(f"Processing metadata from {metadata}...")
                 with open(metadata) as f:
                     csv_reader = list(csv.reader(f))
                     _ = csv_reader.pop(0)  # skip the header
-                    for row in tqdm(csv_reader, desc="Processing metadata"):
+                    
+                    if mini_dataset:
+                        csv_reader = csv_reader[:100]  # Limit for mini dataset
+                    
+                    print(f"Processing {len(csv_reader)} samples from {metadata.split('/')[-1]}...")
+                    for row in tqdm(csv_reader, desc="Loading EK100 dataset metadata"):
                         pid, vid = row[1:3]
                         # Use frame numbers directly from CSV (columns 6 and 7)
                         start_frame, end_frame = int(row[6]), int(row[7])
                         narration = row[8]
                         verb, noun = int(row[10]), int(row[12])
-                        vid_path = '{}/videos/{}.MP4'.format(pid, vid)
+                        
+                        # Try both path structures
+                        vid_path = '{}/{}.MP4'.format(pid, vid)
+                        full_path = osp.join(self.root, vid_path)
+                        
+                        # Check if video exists, if not try videos subdirectory
+                        if not osp.exists(full_path):
+                            vid_path = '{}/videos/{}.MP4'.format(pid, vid)
+                            full_path = osp.join(self.root, vid_path)
                         self.samples.append((vid_path, start_frame, end_frame, narration, verb, noun))
+                
+                if mini_dataset:
+                    print(f"Mini dataset mode: Using {len(self.samples)} samples")
+            
             if self.dataset == 'ek100_mir':
                 self.metadata_sentence = pd.read_csv(metadata[:metadata.index('.csv')] + '_sentence.csv')
                 if 'train' in metadata:
@@ -326,8 +302,7 @@ class VideoCaptionDatasetBase(torch.utils.data.Dataset):
         else:
             raise NotImplementedError
 
-    def get_raw_item(self, i, is_training=True, num_clips=1, clip_length=32, clip_stride=2, sparse_sample=False,
-                     narration_selection='random'):
+    def get_raw_item(self, i, is_training=True, num_clips=1, clip_length=32, clip_stride=2, sparse_sample=False, narration_selection='random'):
         if self.dataset == 'ego4d':
             if len(self.samples[i]) == 4:
                 vid, start_second, end_second, narration = self.samples[i]
@@ -395,43 +370,62 @@ class VideoCaptionDatasetBase(torch.utils.data.Dataset):
         elif self.dataset == 'ek100_cls':
             vid_path, start_frame, end_frame, narration, verb, noun = self.samples[i]
             frame_ids = get_frame_ids(start_frame, end_frame, num_segments=clip_length, jitter=is_training)
+            #print('frame_ids', frame_ids)
+            frame_ids_flow = []
+            for i in range(len(frame_ids)):
+                frame_ids_flow.append(frame_ids[i]+1)
+            #print('frame_ids_flow', frame_ids_flow)
+            frame_ids = frame_ids + frame_ids_flow
             frames = video_loader_by_frames(self.root, vid_path, frame_ids)
+            #frames_flow = video_loader_by_frames(self.root, vid_path, frame_ids_flow)
+            frames_flow =  frames[16:,:,:,:]
+            frames =  frames[:16,:,:,:]
+            
             # Check if we're doing verb/noun classification or action classification
             if hasattr(self, 'args') and hasattr(self.args, 'egtea_finetune_type'):
                 if self.args.egtea_finetune_type == 'verb':
-                    return frames, str(verb)
+                    return frames, frames_flow, str(verb)
                 elif self.args.egtea_finetune_type == 'noun':
-                    return frames, str(noun)
-            return frames, '{}:{}'.format(verb, noun)
+                    return frames, frames_flow, str(noun)
+            return frames, frames_flow, '{}:{}'.format(verb, noun)
         elif self.dataset == 'egtea':
-            vid_path, start_frame, end_frame, sentence = self.samples[i]
+            vid_path, start_frame, end_frame, sentence = self.samples[i] # start and end frame is the begin and end of clip
             if is_training:
                 #print('is train')
                 assert num_clips == 1
                 if end_frame < clip_length * clip_stride:
                     frames = video_loader_by_frames(self.root, vid_path, list(np.arange(0, end_frame)))
-                    zeros = torch.zeros((clip_length * clip_stride - end_frame, *frames.shape[1:]))
-                    frames = torch.cat((frames, zeros), dim=0)
+                    zeros = torch.zeros((clip_length * clip_stride - end_frame, *frames.shape[1:])) 
+                    frames = torch.cat((frames, zeros), dim=0)                    
+                    frames_flow = frames[1::clip_stride]
                     frames = frames[::clip_stride]
                 else:
-                    start_id = np.random.randint(0, end_frame - clip_length * clip_stride + 1)
-                    frame_ids = np.arange(start_id, start_id + clip_length * clip_stride, clip_stride)
+                    start_id = np.random.randint(0, end_frame - clip_length * clip_stride + 1) 
+                    frame_ids = np.arange(start_id, start_id + clip_length * clip_stride, clip_stride) 
+                    frame_ids_flow = np.arange(start_id+1, start_id + clip_length * clip_stride+1, clip_stride) #  +1 to have flow
                     frames = video_loader_by_frames(self.root, vid_path, frame_ids)
+                    frames_flow = video_loader_by_frames(self.root, vid_path, frame_ids_flow)
             else:
                 #print('is val')
                 if end_frame < clip_length * clip_stride:
                     frames = video_loader_by_frames(self.root, vid_path, list(np.arange(0, end_frame)))
                     zeros = torch.zeros((clip_length * clip_stride - end_frame, *frames.shape[1:]))
                     frames = torch.cat((frames, zeros), dim=0)
+                    frames_flow = frames[1::clip_stride]
                     frames = frames[::clip_stride]
                     frames = frames.repeat(num_clips, 1, 1, 1)
+                    frames_flow = frames_flow.repeat(num_clips, 1, 1, 1)
                     #print('end frame <')
                 else:
                     frame_ids = []
                     for start_id in np.linspace(0, end_frame - clip_length * clip_stride, num_clips, dtype=int):
                         frame_ids.extend(np.arange(start_id, start_id + clip_length * clip_stride, clip_stride))
                     frames = video_loader_by_frames(self.root, vid_path, frame_ids)
-            return frames, sentence
+                    frame_ids_flow = []
+                    for start_id in np.linspace(0, end_frame - clip_length * clip_stride, num_clips, dtype=int):
+                        frame_ids_flow.extend(np.arange(start_id+1, start_id + clip_length * clip_stride+1, clip_stride))
+                    frames_flow = video_loader_by_frames(self.root, vid_path, frame_ids_flow)
+            return frames, frames_flow, sentence
         elif self.dataset == 'charades_ego':
             vid_path, start_frame, end_frame, action_list = self.samples[i]
             if sparse_sample:
@@ -471,13 +465,13 @@ class VideoCaptionDatasetBase(torch.utils.data.Dataset):
 
 
 class VideoCaptionDatasetCLIP(VideoCaptionDatasetBase):
-    def __init__(self, args, dataset, root, metadata, transform=None,
+    def __init__(self, dataset, root, metadata, transform=None,
                  is_training=True, tokenizer=None,
                  clip_length=32, clip_stride=2, sparse_sample=False,
                  narration_selection='random',
                  num_hard_negatives=0,
                  subsample_stride=None):
-        super().__init__(args, dataset, root, metadata)
+        super().__init__(dataset, root, metadata)
 
         self.full_samples = self.samples.copy()
         if isinstance(subsample_stride, int):
@@ -590,17 +584,19 @@ class VideoClassyDataset(VideoCaptionDatasetBase):
         self.sparse_sample = sparse_sample
 
     def __getitem__(self, i):
-        frames, label = self.get_raw_item(
+        frames, frames_flow, label = self.get_raw_item(
             i, is_training=self.is_training,
             num_clips=self.num_clips,
             clip_length=self.clip_length,
             clip_stride=self.clip_stride,
             sparse_sample=self.sparse_sample,
         )
+        #print(frames.shape, frames_flow.shape)
 
         # apply transformation
         if self.transform is not None:
             frames = self.transform(frames)
+            frames_flow = self.transform(frames_flow)
 
         if self.label_mapping is not None:
             if isinstance(label, list):
@@ -612,7 +608,7 @@ class VideoClassyDataset(VideoCaptionDatasetBase):
             else:
                 label = self.label_mapping[label]
 
-        return frames, label
+        return frames, frames_flow, label
 
 
 def get_dataset(train_transform, tokenizer, args, is_training=True):

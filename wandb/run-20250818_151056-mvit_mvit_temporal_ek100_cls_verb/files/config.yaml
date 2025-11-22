@@ -1,0 +1,219 @@
+_wandb:
+    value:
+        cli_version: 0.21.0
+        e:
+            km3f5ow5w0f4gcce4dij1x39b1mhcieg:
+                args:
+                    - --dataset
+                    - ek100_cls
+                    - --root
+                    - /mnt/k/EK_Videos/
+                    - --metadata-train
+                    - /home/dz/Projects/multi-modal_AR/data/EK/data/EPIC_100_train.csv
+                    - --metadata-val
+                    - /home/dz/Projects/multi-modal_AR/data/EK/data/EPIC_100_validation.csv
+                    - --output-dir
+                    - output_ckpt/mvit_mvit_temporal_ek100_cls_verb
+                    - --model-type
+                    - mvit_temporal
+                    - --egtea-finetune-type
+                    - verb
+                    - --num-classes
+                    - "97"
+                    - --batch-size
+                    - "8"
+                    - --lr
+                    - "3e-4"
+                    - --wd
+                    - "4e-5"
+                    - --epochs
+                    - "50"
+                    - --warmup-epochs
+                    - "5"
+                    - --eval-freq
+                    - "1"
+                    - --save-freq
+                    - "10"
+                    - --num-clips
+                    - "1"
+                    - --num-crops
+                    - "1"
+                    - --clip-length
+                    - "16"
+                    - --clip-stride
+                    - "2"
+                    - --workers
+                    - "10"
+                    - --seed
+                    - "42"
+                    - --use-checkpoint
+                    - --wandb
+                codePath: main_train_mvit.py
+                codePathLocal: main_train_mvit.py
+                cpu_count: 6
+                cpu_count_logical: 12
+                cudaVersion: "12.9"
+                disk:
+                    /:
+                        total: "1081101176832"
+                        used: "308888166400"
+                email: denizbickici@mailbox.org
+                executable: /home/dz/miniconda3/envs/lavila/bin/python3.9
+                git:
+                    commit: 8002b5ab0db31789b9897a0a9c36729099e21ad4
+                    remote: https://github.com/facebookresearch/LaViLa.git
+                gpu: NVIDIA GeForce RTX 5090
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Blackwell
+                      memoryTotal: "34190917632"
+                      name: NVIDIA GeForce RTX 5090
+                      uuid: GPU-d014d57e-b8b1-47e9-1a3e-c21a45a5075d
+                host: driftphonk
+                memory:
+                    total: "50515324928"
+                os: Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.35
+                program: /home/dz/Projects/multi-modal_AR/LaViLa/main_train_mvit.py
+                python: CPython 3.9.23
+                root: /home/dz/Projects/multi-modal_AR/LaViLa
+                startedAt: "2025-08-18T13:10:56.450176Z"
+                writerId: km3f5ow5w0f4gcce4dij1x39b1mhcieg
+        m: []
+        python_version: 3.9.23
+        t:
+            "1":
+                - 1
+                - 5
+                - 11
+                - 41
+                - 49
+                - 53
+                - 63
+                - 71
+            "2":
+                - 1
+                - 5
+                - 11
+                - 41
+                - 49
+                - 53
+                - 63
+                - 71
+            "3":
+                - 5
+                - 14
+                - 16
+                - 62
+            "4": 3.9.23
+            "5": 0.21.0
+            "6": 4.27.0
+            "12": 0.21.0
+            "13": linux-x86_64
+batch_size:
+    value: 8
+betas:
+    value:
+        - 0.9
+        - 0.999
+clip_grad_type:
+    value: norm
+clip_grad_value:
+    value: null
+clip_length:
+    value: 16
+clip_stride:
+    value: 2
+dataset:
+    value: ek100_cls
+disable_amp:
+    value: false
+dist_backend:
+    value: nccl
+dist_url:
+    value: env://
+distributed:
+    value: false
+drop_path_rate:
+    value: 0.1
+dropout_ratio:
+    value: 0.5
+egtea_finetune_type:
+    value: verb
+epochs:
+    value: 50
+eps:
+    value: 1e-08
+eval_freq:
+    value: 1
+find_unused_parameters:
+    value: false
+fix_lr:
+    value: false
+freeze_temperature:
+    value: false
+gpu:
+    value: cuda
+label_smoothing:
+    value: 0.1
+lr:
+    value: 0.0003
+lr_end:
+    value: 1e-05
+lr_multiplier_on_backbone:
+    value: 0.1
+lr_start:
+    value: 1e-06
+metadata_train:
+    value: /home/dz/Projects/multi-modal_AR/data/EK/data/EPIC_100_train.csv
+metadata_val:
+    value: /home/dz/Projects/multi-modal_AR/data/EK/data/EPIC_100_validation.csv
+mini_dataset:
+    value: false
+model_type:
+    value: mvit_temporal
+num_classes:
+    value: 97
+num_clips:
+    value: 1
+num_crops:
+    value: 1
+output_dir:
+    value: output_ckpt/mvit_mvit_temporal_ek100_cls_verb
+pretrain_model:
+    value: ""
+print_freq:
+    value: 100
+rank:
+    value: 0
+resume:
+    value: ""
+root:
+    value: /mnt/k/EK_Videos/
+save_freq:
+    value: 10
+seed:
+    value: 42
+sparse_sample:
+    value: false
+start_epoch:
+    value: 0
+update_freq:
+    value: 1
+use_checkpoint:
+    value: true
+use_half:
+    value: false
+use_sgd:
+    value: false
+use_zero:
+    value: false
+wandb:
+    value: true
+warmup_epochs:
+    value: 5
+wd:
+    value: 4e-05
+workers:
+    value: 10
+world_size:
+    value: 1

@@ -1,0 +1,14 @@
+python3 main_extract_feature_flow2.py \
+--dataset egtea \
+--metadata-train ../data/EGTEA/raw/annotation/split/train_split1.txt \
+--metadata-val ../data/EGTEA/raw/annotation/split/test_split1.txt \
+--root /mnt/j/video_clips/cropped_clips/ \
+--pretrain-model ../mvit_temp_EGTEA_verb_ethereal-valley-107/model.safetensors \
+--num-classes 19 \
+--batch-size 4 \
+--use-sgd --wd 4e-5 \
+--output-dir 'output' \
+--egtea_finetune_type 'verb' \
+--num-clips 10 \
+--num-crops 3 \
+--use-checkpoint

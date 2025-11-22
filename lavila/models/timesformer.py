@@ -110,7 +110,7 @@ class VarAttention(nn.Module):
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
-        q *= self.scale
+        q = self.scale *q
 
         # splice out CLS token at index 1
         (cls_q, q_), (cls_k, k_), (cls_v, v_) = map(lambda t: (t[:, 0:1], t[:, 1:]), (q, k, v))

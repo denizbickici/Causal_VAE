@@ -1,0 +1,12 @@
+replace 'lavila' folder in lavila repo with the 'lavila' folder here.
+put other files in the lavila repo
+
+run extract.sh to extract features from rgb images
+change the following args
+	--resume 'output/verb/checkpoint_best.pt' # replace with checkpoints for verb and noun
+	--egtea_finetune_type 'verb'  # verb or noun
+	
+run extract_flow.sh to extract features from flow images
+change the following args
+	--resume 'output/flow/checkpoint_0100.pt' \ # replace with checkpoints for verb and noun
+	--egtea_finetune_type 'verb'  # verb or noun

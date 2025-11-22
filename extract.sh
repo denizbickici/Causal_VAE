@@ -1,0 +1,15 @@
+python3 main_extract_feature.py \
+--dataset egtea \
+--metadata-train ../data/EGTEA/raw/annotation/split/train_split1.txt \
+--metadata-val ../data/EGTEA/raw/annotation/split/test_split1.txt \
+--root /mnt/j/video_clips/cropped_clips/ \
+--pretrain-model /home/dz/Projects/multi-modal_AR/mvit_spat_EGTEA_noun_stage2_fluent-cosmos-238/model.safetensors \
+--num-classes 53 \
+--batch-size 4 \
+--use-sgd --wd 4e-5 \
+--output-dir 'output' \
+--egtea_finetune_type 'noun' \
+--model_type 'mvit' \
+--num-clips 10 \
+--num-crops 3 \
+--use-checkpoint

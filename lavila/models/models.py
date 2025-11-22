@@ -42,7 +42,7 @@ class VideoClassifier(nn.Module):
             assert len(image_embed) == 1
             image_embed = image_embed[0]
         logit = self.fc_cls(self.dropout(image_embed))
-        return logit
+        return logit, image_embed
 
 
 class VideoClassifierMultiHead(nn.Module):
@@ -69,7 +69,7 @@ class VideoClassifierMultiHead(nn.Module):
             assert len(image_embed) == 1
             image_embed = image_embed[0]
         logit_list = [m(self.dropout(image_embed)) for m in self.fc_cls]
-        return logit_list
+        return logit_list, image_embed
 
 
 class CLIP(nn.Module):
@@ -1154,11 +1154,11 @@ def VCLM_OPENAI_TIMESFORMER_LARGE_336PX_GPT2_XL(
         act_layer=QuickGELU,
         is_tanh_gating=timesformer_gated_xattn,
     )
-    clip_model, _ = load_openai_clip('ViT-L/14@336px', 'cpu')
+    clip_model, _ = load_openai_clip('ViT-L/14@336px', 'cpu', download_root='openai_pretrained/clip')
     print("=> Loading CLIP (ViT-L/14@336px) weights")
     remapped_state_dict = remap_keys(clip_model.visual.state_dict(), transformer_layers=24)
     res = vision_model.load_state_dict(remapped_state_dict, strict=False)
-    print(res)
+    #print(res)
     vision_model.head = nn.Identity()
     vision_model.pre_logits = nn.Identity()
     vision_model.fc = nn.Identity()
@@ -1166,6 +1166,7 @@ def VCLM_OPENAI_TIMESFORMER_LARGE_336PX_GPT2_XL(
     gpt2 = GPT2LMHeadModel.from_pretrained(
         "gpt2-xl",
         use_cache=False,
+        cache_dir='openai_pretrained/gpt2',
     )
     new_config = augment_gpt2_config(gpt2.config, cross_attn_freq=3, gated_xattn=gated_xattn)
     text_decoder = GatedGPT2LMHeadModel(new_config)

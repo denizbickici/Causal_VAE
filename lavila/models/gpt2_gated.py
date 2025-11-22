@@ -1155,7 +1155,8 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             loss=loss,
             logits=lm_logits,
             past_key_values=transformer_outputs.past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
+            #hidden_states=transformer_outputs.hidden_states,
+            hidden_states=hidden_states,
             attentions=transformer_outputs.attentions,
             cross_attentions=transformer_outputs.cross_attentions,
         )
