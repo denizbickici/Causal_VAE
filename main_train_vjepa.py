@@ -153,6 +153,18 @@ def get_args_parser():
     # Data
     parser.add_argument('--dataset', default='egtea', type=str,
                         choices=['ek100_cls', 'egtea'])
+    parser.add_argument('--ek100-train-csv',
+                        default='/home/dz/Projects/multi-modal_AR/data/EK/data/EPIC_100_train.csv',
+                        type=str, help='path to EK100 train csv for label map')
+    parser.add_argument('--ek100-val-csv',
+                        default='/home/dz/Projects/multi-modal_AR/data/EK/data/EPIC_100_validation.csv',
+                        type=str, help='path to EK100 val csv for label map')
+    parser.add_argument('--egtea-idx-root',
+                        default='../data/EGTEA/raw/annotation/idx',
+                        type=str, help='root dir containing egtea idx txt files')
+    parser.add_argument('--charades-classlist',
+                        default='datasets/CharadesEgo/CharadesEgo/Charades_v1_classes.txt',
+                        type=str, help='class list txt for CharadesEgo')
     parser.add_argument('--root',
                         default='/mnt/j/video_clips/cropped_clips/',
                         type=str, help='path to dataset root')

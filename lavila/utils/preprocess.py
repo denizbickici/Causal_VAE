@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 import csv
 
 from lavila.models.tokenizer import MyBertTokenizer, MyDistilBertTokenizer, MyGPT2Tokenizer, SimpleTokenizer
@@ -12,15 +13,20 @@ from lavila.models.tokenizer import MyBertTokenizer, MyDistilBertTokenizer, MyGP
 def generate_label_map(dataset, args):
     if dataset == 'ek100_cls':
         finetune_type = getattr(args, 'egtea_finetune_type', 'action')  # Use same arg name for consistency
+        train_csv = getattr(
+            args, 'ek100_train_csv',
+            '/home/dz/Projects/multi-modal_AR/data/EK/data/EPIC_100_train.csv'
+        )
+        val_csv = getattr(
+            args, 'ek100_val_csv',
+            '/home/dz/Projects/multi-modal_AR/data/EK/data/EPIC_100_validation.csv'
+        )
         
         if finetune_type == 'verb':
             print("Preprocess ek100 verb label space")
             verb_list = []
             mapping_verb2narration = {}
-            for f in [
-                '/home/dz/Projects/multi-modal_AR/data/EK/data/EPIC_100_train.csv',
-                '/home/dz/Projects/multi-modal_AR/data/EK/data/EPIC_100_validation.csv',
-            ]:
+            for f in [train_csv, val_csv]:
                 csv_reader = csv.reader(open(f))
                 _ = next(csv_reader)  # skip the header
                 for row in csv_reader:
@@ -42,10 +48,7 @@ def generate_label_map(dataset, args):
             print("Preprocess ek100 noun label space")
             noun_list = []
             mapping_noun2narration = {}
-            for f in [
-                '/home/dz/Projects/multi-modal_AR/data/EK/data/EPIC_100_train.csv',
-                '/home/dz/Projects/multi-modal_AR/data/EK/data/EPIC_100_validation.csv',
-            ]:
+            for f in [train_csv, val_csv]:
                 csv_reader = csv.reader(open(f))
                 _ = next(csv_reader)  # skip the header
                 for row in csv_reader:
@@ -67,10 +70,7 @@ def generate_label_map(dataset, args):
             print("Preprocess ek100 action label space")
             vn_list = []
             mapping_vn2narration = {}
-            for f in [
-                '/home/dz/Projects/multi-modal_AR/data/EK/data/EPIC_100_train.csv',
-                '/home/dz/Projects/multi-modal_AR/data/EK/data/EPIC_100_validation.csv',
-            ]:
+            for f in [train_csv, val_csv]:
                 csv_reader = csv.reader(open(f))
                 _ = next(csv_reader)  # skip the header
                 for row in csv_reader:
@@ -92,7 +92,11 @@ def generate_label_map(dataset, args):
         print("=> preprocessing charades_ego action label space")
         vn_list = []
         labels = []
-        with open('datasets/CharadesEgo/CharadesEgo/Charades_v1_classes.txt') as f:
+        class_list_path = getattr(
+            args, 'charades_classlist',
+            'datasets/CharadesEgo/CharadesEgo/Charades_v1_classes.txt'
+        )
+        with open(class_list_path) as f:
             csv_reader = csv.reader(f)
             for row in csv_reader:
                 vn = row[0][:4]
@@ -110,7 +114,12 @@ def generate_label_map(dataset, args):
             txt_file = 'verb_idx'  
         if args.egtea_finetune_type == 'noun':
             txt_file = 'noun_idx'
-        with open('../data/EGTEA/raw/annotation/idx/'+txt_file+'.txt') as f: # action_idx 106 verb_idx 19 noun_idx 53
+        idx_root = getattr(
+            args, 'egtea_idx_root',
+            '../data/EGTEA/raw/annotation/idx'
+        )
+        idx_path = os.path.join(idx_root, txt_file + '.txt')
+        with open(idx_path) as f: # action_idx 106 verb_idx 19 noun_idx 53
             for row in f:
                 row = row.strip()
                 narration = ' '.join(row.split(' ')[:-1])

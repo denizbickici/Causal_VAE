@@ -1,0 +1,15 @@
+python3 main_extract_feature_vjepa.py \
+--dataset egtea \
+--task-type noun \
+--metadata-train ../data/EGTEA/raw/annotation/split/train_split1.txt \
+--metadata-val ../data/EGTEA/raw/annotation/split/test_split1.txt \
+--root /mnt/j/video_clips/cropped_clips/ \
+--pretrain-model /path/to/vjepa_checkpoint.pt \
+--model-type vjepa2_large \
+--num-classes 53 \
+--batch-size 4 \
+--num-clips 10 \
+--num-crops 3 \
+--clip-length 16 \
+--clip-stride 2 \
+--output-dir output_vjepa

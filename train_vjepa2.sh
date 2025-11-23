@@ -22,10 +22,13 @@ if [ "$DATASET" = "ek100_cls" ]; then
     ROOT_DIR="/mnt/k/EK100_256p"
     TRAIN_META="/home/dz/Projects/multi-modal_AR/data/EK/data/EPIC_100_train.csv"
     VAL_META="/home/dz/Projects/multi-modal_AR/data/EK/data/EPIC_100_validation.csv"
+    EK100_TRAIN_CSV="$TRAIN_META"
+    EK100_VAL_CSV="$VAL_META"
 elif [ "$DATASET" = "egtea" ]; then
     ROOT_DIR="/mnt/j/video_clips/cropped_clips/"
     TRAIN_META="../data/EGTEA/raw/annotation/split/train_split1.txt"
     VAL_META="../data/EGTEA/raw/annotation/split/test_split1.txt"
+    EGTEA_IDX_ROOT="../data/EGTEA/raw/annotation/idx"
 else
     echo "Unknown dataset: $DATASET"
     exit 1
@@ -68,6 +71,9 @@ CMD="python main_train_vjepa.py \
     --root $ROOT_DIR \
     --metadata-train $TRAIN_META \
     --metadata-val $VAL_META \
+    ${EK100_TRAIN_CSV:+--ek100-train-csv $EK100_TRAIN_CSV} \
+    ${EK100_VAL_CSV:+--ek100-val-csv $EK100_VAL_CSV} \
+    ${EGTEA_IDX_ROOT:+--egtea-idx-root $EGTEA_IDX_ROOT} \
     --output-dir $OUTPUT_DIR \
     --model-type $MODEL_TYPE \
     --task-type $TASK_TYPE \
