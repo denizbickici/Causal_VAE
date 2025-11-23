@@ -229,7 +229,9 @@ class VideoCaptionDatasetBase(torch.utils.data.Dataset):
                     start_frame, end_frame = int(row[6]), int(row[7])
                     narration = row[8]
                     verb, noun = int(row[10]), int(row[12])
-                    vid_path = '{}/videos/{}.MP4'.format(pid, vid)
+                    vid_path = '{}/{}.MP4'.format(pid, vid)
+                    if not osp.exists(osp.join(self.root, vid_path)):
+                        vid_path = '{}/videos/{}.MP4'.format(pid, vid)
                     self.samples.append((vid_path, start_frame, end_frame, narration, verb, noun))
             else:
                 # Frame-based loading (current approach, faster)
@@ -239,14 +241,17 @@ class VideoCaptionDatasetBase(torch.utils.data.Dataset):
                 with open(metadata) as f:
                     csv_reader = list(csv.reader(f))
                     _ = csv_reader.pop(0)  # skip the header
-                    for row in tqdm(csv_reader, desc="Processing metadata"):
-                        pid, vid = row[1:3]
-                        # Use frame numbers directly from CSV (columns 6 and 7)
-                        start_frame, end_frame = int(row[6]), int(row[7])
-                        narration = row[8]
-                        verb, noun = int(row[10]), int(row[12])
+                for row in tqdm(csv_reader, desc="Processing metadata"):
+                    pid, vid = row[1:3]
+                    # Use frame numbers directly from CSV (columns 6 and 7)
+                    start_frame, end_frame = int(row[6]), int(row[7])
+                    narration = row[8]
+                    verb, noun = int(row[10]), int(row[12])
+                    # Prefer direct pid/vid layout, fallback to pid/videos/vid
+                    vid_path = '{}/{}.MP4'.format(pid, vid)
+                    if not osp.exists(osp.join(self.root, vid_path)):
                         vid_path = '{}/videos/{}.MP4'.format(pid, vid)
-                        self.samples.append((vid_path, start_frame, end_frame, narration, verb, noun))
+                    self.samples.append((vid_path, start_frame, end_frame, narration, verb, noun))
             if self.dataset == 'ek100_mir':
                 self.metadata_sentence = pd.read_csv(metadata[:metadata.index('.csv')] + '_sentence.csv')
                 if 'train' in metadata:
