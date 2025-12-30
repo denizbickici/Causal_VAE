@@ -15,7 +15,9 @@ import random
 import decord
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
+from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 
 
 def datetime2sec(str):
@@ -582,6 +584,97 @@ class VideoClassyDataset(VideoCaptionDatasetBase):
         self.clip_length = clip_length
         self.clip_stride = clip_stride
         self.sparse_sample = sparse_sample
+        self.flow_clip_value = getattr(args, 'flow_clip_value', 20.0) if args else 20.0
+        self.flow_size = getattr(args, 'flow_size', getattr(args, 'crop_size', 224)) if args else 224
+        self.flow_device = None
+        self.flow_model = None
+        self._init_flow_model()
+
+    def _init_flow_model(self):
+        weights = Raft_Large_Weights.C_T_SKHT_V2
+        self.flow_model = raft_large(weights=weights, progress=False)
+        self.flow_model.eval()
+        self.flow_model.requires_grad_(False)
+        flow_device = None
+        if self.args is not None:
+            flow_device = getattr(self.args, 'flow_device', None)
+        if flow_device is None:
+            flow_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.flow_device = torch.device(flow_device)
+        self.flow_model.to(self.flow_device)
+
+    def _apply_transform_pair(self, frames, frames_flow):
+        if self.transform is None:
+            return frames, frames_flow
+        torch_state = torch.get_rng_state()
+        py_state = random.getstate()
+        np_state = np.random.get_state()
+        frames = self.transform(frames)
+        torch.set_rng_state(torch_state)
+        random.setstate(py_state)
+        np.random.set_state(np_state)
+        frames_flow = self.transform(frames_flow)
+        return frames, frames_flow
+
+    def _ensure_cthw(self, clip):
+        if clip.ndim != 4:
+            raise ValueError(f'Expected 4D clip, got shape {clip.shape}')
+        if clip.shape[-1] in (2, 3):
+            clip = clip.permute(3, 0, 1, 2)
+        return clip
+
+    def _normalize_clip(self, clip):
+        clip = clip.float()
+        if clip.max().item() > 1.0:
+            clip = clip / 255.0
+        return clip
+
+    def _resize_clip(self, clip):
+        if self.flow_size is None:
+            return clip
+        if isinstance(self.flow_size, (tuple, list)):
+            target_h, target_w = self.flow_size
+        else:
+            target_h = target_w = int(self.flow_size)
+        _, _, height, width = clip.shape
+        if height == target_h and width == target_w:
+            return clip
+        clip_tchw = clip.permute(1, 0, 2, 3)
+        clip_tchw = F.interpolate(
+            clip_tchw,
+            size=(target_h, target_w),
+            mode='bilinear',
+            align_corners=False,
+        )
+        return clip_tchw.permute(1, 0, 2, 3)
+
+    def _prepare_clip(self, clip):
+        clip = self._ensure_cthw(clip)
+        clip = self._normalize_clip(clip)
+        clip = self._resize_clip(clip)
+        return clip
+
+    def _compute_flow_clip(self, frames, frames_flow):
+        frames = self._prepare_clip(frames)
+        frames_flow = self._prepare_clip(frames_flow)
+        frames = frames.to(self.flow_device)
+        frames_flow = frames_flow.to(self.flow_device)
+        flows = []
+        with torch.no_grad():
+            for t in range(frames.shape[1]):
+                frame1 = frames[:, t, :, :].unsqueeze(0).contiguous()
+                frame2 = frames_flow[:, t, :, :].unsqueeze(0).contiguous()
+                flow_out = self.flow_model(frame1, frame2)
+                flow = flow_out[-1].squeeze(0)
+                flows.append(flow)
+        flow = torch.stack(flows, dim=0)
+        flow = flow.clamp(-self.flow_clip_value, self.flow_clip_value) / self.flow_clip_value
+        return flow.cpu()
+
+    def _compute_flow(self, frames, frames_flow):
+        if isinstance(frames, list):
+            return [self._compute_flow_clip(f, f_flow) for f, f_flow in zip(frames, frames_flow)]
+        return self._compute_flow_clip(frames, frames_flow)
 
     def __getitem__(self, i):
         frames, frames_flow, label = self.get_raw_item(
@@ -591,12 +684,8 @@ class VideoClassyDataset(VideoCaptionDatasetBase):
             clip_stride=self.clip_stride,
             sparse_sample=self.sparse_sample,
         )
-        #print(frames.shape, frames_flow.shape)
-
-        # apply transformation
-        if self.transform is not None:
-            frames = self.transform(frames)
-            frames_flow = self.transform(frames_flow)
+        frames, frames_flow = self._apply_transform_pair(frames, frames_flow)
+        flow = self._compute_flow(frames, frames_flow)
 
         if self.label_mapping is not None:
             if isinstance(label, list):
@@ -608,7 +697,7 @@ class VideoClassyDataset(VideoCaptionDatasetBase):
             else:
                 label = self.label_mapping[label]
 
-        return frames, frames_flow, label
+        return flow, label
 
 
 def get_dataset(train_transform, tokenizer, args, is_training=True):
