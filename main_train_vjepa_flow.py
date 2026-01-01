@@ -519,8 +519,23 @@ def main(args):
                 adapt_vjepa_for_flow(model)
                 adapted_before_load = True
                 print("=> Adapted V-JEPA patch embedding for 2-channel flow input (flow checkpoint)")
-        
-        missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, strict=False)
+
+        model_state = model.state_dict()
+        pruned_state_dict = OrderedDict()
+        skipped_keys = []
+        for key, value in new_state_dict.items():
+            if key not in model_state:
+                continue
+            if model_state[key].shape != value.shape:
+                skipped_keys.append((key, tuple(value.shape), tuple(model_state[key].shape)))
+                continue
+            pruned_state_dict[key] = value
+
+        missing_keys, unexpected_keys = model.load_state_dict(pruned_state_dict, strict=False)
+        if skipped_keys:
+            print("Skipped loading keys with shape mismatches:")
+            for key, loaded_shape, model_shape in skipped_keys:
+                print(f"  {key}: checkpoint {loaded_shape} vs model {model_shape}")
         if missing_keys:
             print(f"Missing keys: {missing_keys}")
         if unexpected_keys:
