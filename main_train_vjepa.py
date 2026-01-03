@@ -206,6 +206,9 @@ def get_args_parser():
     parser.add_argument('--betas', default=(0.9, 0.999), nargs=2, type=float)
     parser.add_argument('--eps', default=1e-8, type=float)
     parser.add_argument('--label-smoothing', default=0.1, type=float)
+    parser.add_argument('--class-weight', default='none', type=str,
+                        choices=['none', 'balanced'],
+                        help='use class-balanced weights for cross-entropy')
     parser.add_argument('--clip-grad-value', default=1.0, type=float, help='gradient clipping')
     parser.add_argument('--update-freq', default=1, type=int,
                         help='gradient accumulation steps')
@@ -263,6 +266,35 @@ def save_checkpoint(state, is_best, output_dir):
     if is_best:
         best_path = os.path.join(output_dir, 'checkpoint_best.pt')
         torch.save(state, best_path)
+
+
+def compute_class_weights(args, train_dataset, label_mapping):
+    counts = np.zeros(args.num_classes, dtype=np.int64)
+    if args.dataset == 'ek100_cls':
+        for sample in train_dataset.samples:
+            verb = sample[4]
+            noun = sample[5]
+            if args.task_type == 'verb':
+                label_key = str(verb)
+            elif args.task_type == 'noun':
+                label_key = str(noun)
+            else:
+                label_key = f"{verb}:{noun}"
+            idx = label_mapping.get(label_key)
+            if idx is not None:
+                counts[idx] += 1
+    elif args.dataset == 'egtea':
+        for sample in train_dataset.samples:
+            label_key = sample[3]
+            idx = label_mapping.get(label_key)
+            if idx is not None:
+                counts[idx] += 1
+    else:
+        raise ValueError(f'Unsupported dataset for class weights: {args.dataset}')
+
+    counts = np.maximum(counts, 1)
+    weights = counts.sum() / (len(counts) * counts.astype(np.float32))
+    return torch.tensor(weights, dtype=torch.float32)
 
 
 def train(train_loader, model, flow_model, criterion, optimizer, scaler, epoch, lr_schedule, args):
@@ -603,9 +635,6 @@ def main(args):
     # Create gradient scaler for mixed precision
     scaler = amp.GradScaler(enabled=not args.disable_amp)
     
-    # Create loss function
-    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).cuda(args.gpu)
-    
     # Resume from checkpoint
     best_acc1 = 0.
     if args.resume:
@@ -734,6 +763,17 @@ def main(args):
     print(f'Training batches: {len(train_loader)}')
     print(f'Validation samples: {len(val_dataset)}')
     print(f'Validation batches: {len(val_loader)}')
+
+    # Create loss function (optionally class-balanced)
+    if args.class_weight == 'balanced':
+        class_weights = compute_class_weights(args, train_dataset, mapping_vn2act)
+        if dist_utils.is_main_process():
+            print('=> Using balanced class weights for cross-entropy '
+                  f'(min={class_weights.min().item():.4f}, max={class_weights.max().item():.4f})')
+        class_weights = class_weights.cuda(args.gpu)
+        criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=args.label_smoothing).cuda(args.gpu)
+    else:
+        criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).cuda(args.gpu)
     
     # Learning rate schedule
     lr_schedule = cosine_scheduler(
