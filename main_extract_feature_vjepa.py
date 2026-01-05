@@ -391,6 +391,8 @@ def get_args_parser():
 						help='backbone to use for extraction')
 	parser.add_argument('--pretrain-model', default='', type=str, help='path to checkpoint to load')
 	parser.add_argument('--resume', default='', type=str, help='alternative checkpoint path')
+	parser.add_argument('--skip-checkpoint', action='store_true',
+						help='skip loading external checkpoint and use backbone default weights')
 	parser.add_argument('--dropout-ratio', default=0.5, type=float, help='dropout ratio in classifier head')
 	parser.add_argument('--num-classes', default=None, type=int, help='override class count (otherwise inferred)')
 	parser.add_argument('--use-half', action='store_true', help='use half precision at inference')
@@ -448,18 +450,20 @@ def main(args):
 	else:
 		raise ValueError(f'Unknown model type: {args.model_type}')
 
-	# Load checkpoint
+	# Load checkpoint (optional)
 	ckpt_path = args.resume or args.pretrain_model
-	if not ckpt_path:
-		raise ValueError('No checkpoint path provided. Use --pretrain-model or --resume.')
-	checkpoint = load_checkpoint(ckpt_path)
-	state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
-	new_state_dict = OrderedDict((k.replace('module.', ''), v) for k, v in state_dict.items())
-	missing, unexpected = model.load_state_dict(new_state_dict, strict=False)
-	if missing:
-		print(f"Missing keys in state dict: {missing}")
-	if unexpected:
-		print(f"Unexpected keys in state dict: {unexpected}")
+	ckpt_is_empty = not ckpt_path or ckpt_path.strip().lower() in {'none', 'null', 'nil'}
+	if args.skip_checkpoint or ckpt_is_empty:
+		print("No checkpoint provided; using backbone default weights.")
+	else:
+		checkpoint = load_checkpoint(ckpt_path)
+		state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
+		new_state_dict = OrderedDict((k.replace('module.', ''), v) for k, v in state_dict.items())
+		missing, unexpected = model.load_state_dict(new_state_dict, strict=False)
+		if missing:
+			print(f"Missing keys in state dict: {missing}")
+		if unexpected:
+			print(f"Unexpected keys in state dict: {unexpected}")
 
 	model.cuda(args.gpu)
 
