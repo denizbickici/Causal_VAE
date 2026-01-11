@@ -1013,7 +1013,12 @@ def main(args):
             raise ValueError("Multi-task training is only supported for V-JEPA2 models.")
         if args.vjepa2_head != 'attentive':
             raise ValueError("Multi-task training requires the attentive V-JEPA2 head.")
-        label_maps = build_ek100_multitask_label_maps(args.ek100_train_csv)
+        train_csv = args.ek100_train_csv
+        if not os.path.exists(train_csv):
+            train_csv = args.metadata_train
+            if dist_utils.is_main_process():
+                print(f"=> Using metadata_train for label maps: {train_csv}")
+        label_maps = build_ek100_multitask_label_maps(train_csv)
         args.num_classes_action = len(label_maps["action"])
         args.num_classes_verb = len(label_maps["verb"])
         args.num_classes_noun = len(label_maps["noun"])

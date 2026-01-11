@@ -106,6 +106,8 @@ CMD="python main_train_vjepa_probe.py \
     --root $ROOT_DIR \
     --metadata-train $TRAIN_META \
     --metadata-val $VAL_META \
+    --ek100-train-csv $TRAIN_META \
+    --ek100-val-csv $VAL_META \
     --output-dir $OUTPUT_DIR \
     --model-type $MODEL_TYPE \
     --task-type $TASK_TYPE \
