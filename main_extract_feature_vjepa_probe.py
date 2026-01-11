@@ -12,7 +12,9 @@ Outputs follow the same format as the original extractor:
 
 import argparse
 from collections import OrderedDict
+import csv
 import os
+import sys
 import time
 
 import torch
@@ -31,6 +33,7 @@ except ImportError:
 	print("Warning: safetensors not available. Install with 'pip install safetensors' to load .safetensors files.")
 
 from lavila.data import datasets, datasets_flow
+from lavila.data.datasets import VideoCaptionDatasetBase, get_frame_ids, video_loader_by_frames
 from lavila.data.video_transforms import Permute, SpatialCrop, TemporalCrop
 from lavila.models.tokenizer import SimpleTokenizer
 from lavila.utils import distributed as dist_utils
@@ -48,6 +51,28 @@ VJEPA2_MODEL_SPECS = {
 	'vjepa2_giant': {'hub_name': 'vjepa2_vit_giant', 'crop_size': 256},
 	'vjepa2_giant_384': {'hub_name': 'vjepa2_vit_giant_384', 'crop_size': 384},
 }
+
+
+def _get_vjepa2_attentive_pooler():
+	vjepa2_root = os.path.join(os.path.dirname(__file__), "thirdparty", "vjepa2")
+	if os.path.isdir(vjepa2_root) and vjepa2_root not in sys.path:
+		sys.path.append(vjepa2_root)
+	try:
+		from src.models.attentive_pooler import AttentivePooler
+	except Exception as exc:
+		raise RuntimeError(
+			"Failed to import V-JEPA2 attentive pooler. "
+			"Ensure thirdparty/vjepa2 is present and on the Python path."
+		) from exc
+	return AttentivePooler
+
+
+def _load_vjepa2_encoder(variant_key: str):
+	if variant_key not in VJEPA2_MODEL_SPECS:
+		raise ValueError(f'Unsupported V-JEPA2 variant: {variant_key}')
+	hub_name = VJEPA2_MODEL_SPECS[variant_key]['hub_name']
+	encoder, _ = torch.hub.load('facebookresearch/vjepa2', hub_name)
+	return encoder
 
 
 def load_checkpoint(checkpoint_path: str):
@@ -68,14 +93,8 @@ class VJEPA2FeatureExtractor(nn.Module):
 
 	def __init__(self, variant_key: str, num_classes: int, dropout: float = 0.5):
 		super().__init__()
-		if variant_key not in VJEPA2_MODEL_SPECS:
-			raise ValueError(f'Unsupported V-JEPA2 variant: {variant_key}')
-
-		hub_name = VJEPA2_MODEL_SPECS[variant_key]['hub_name']
-		encoder, _ = torch.hub.load('facebookresearch/vjepa2', hub_name)
-
-		self.encoder = encoder
-		self.num_features = encoder.embed_dim
+		self.encoder = _load_vjepa2_encoder(variant_key)
+		self.num_features = self.encoder.embed_dim
 		self.classifier = nn.Sequential(
 			nn.Dropout(p=dropout),
 			nn.Linear(self.num_features, num_classes),
@@ -88,6 +107,87 @@ class VJEPA2FeatureExtractor(nn.Module):
 		if return_features:
 			return logits, tokens, pooled
 		return logits
+
+
+class VJEPA2MultiTaskProbeHead(nn.Module):
+	"""Attentive probe head with verb/noun/action classifiers."""
+
+	def __init__(
+		self,
+		embed_dim: int,
+		num_verb_classes: int,
+		num_noun_classes: int,
+		num_action_classes: int,
+		num_heads: int,
+		depth: int,
+		mlp_ratio: float = 4.0,
+		dropout: float = 0.0,
+		use_activation_checkpointing: bool = True,
+	):
+		super().__init__()
+		AttentivePooler = _get_vjepa2_attentive_pooler()
+		self.pooler = AttentivePooler(
+			num_queries=3,
+			embed_dim=embed_dim,
+			num_heads=num_heads,
+			depth=depth,
+			mlp_ratio=mlp_ratio,
+			use_activation_checkpointing=use_activation_checkpointing,
+		)
+		self.dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
+		self.verb_classifier = nn.Linear(embed_dim, num_verb_classes, bias=True)
+		self.noun_classifier = nn.Linear(embed_dim, num_noun_classes, bias=True)
+		self.action_classifier = nn.Linear(embed_dim, num_action_classes, bias=True)
+
+	def forward(self, x, return_features: bool = False):
+		pooled = self.pooler(x)
+		verb_feat, noun_feat, action_feat = pooled[:, 0, :], pooled[:, 1, :], pooled[:, 2, :]
+		verb_logits = self.verb_classifier(self.dropout(verb_feat))
+		noun_logits = self.noun_classifier(self.dropout(noun_feat))
+		action_logits = self.action_classifier(self.dropout(action_feat))
+		logits = dict(verb=verb_logits, noun=noun_logits, action=action_logits)
+		if return_features:
+			feats = dict(verb=verb_feat, noun=noun_feat, action=action_feat)
+			return logits, feats
+		return logits
+
+
+class VJEPA2MultiTaskProbeClassifier(nn.Module):
+	"""V-JEPA2 encoder with multi-task attentive probes."""
+
+	def __init__(
+		self,
+		variant_key: str,
+		num_verb_classes: int,
+		num_noun_classes: int,
+		num_action_classes: int,
+		probe_num_heads: int = 16,
+		probe_num_blocks: int = 4,
+		probe_mlp_ratio: float = 4.0,
+		probe_dropout: float = 0.0,
+		use_activation_checkpointing: bool = True,
+	):
+		super().__init__()
+		self.encoder = _load_vjepa2_encoder(variant_key)
+		self.num_features = self.encoder.embed_dim
+		self.probe = VJEPA2MultiTaskProbeHead(
+			embed_dim=self.num_features,
+			num_verb_classes=num_verb_classes,
+			num_noun_classes=num_noun_classes,
+			num_action_classes=num_action_classes,
+			num_heads=probe_num_heads,
+			depth=probe_num_blocks,
+			mlp_ratio=probe_mlp_ratio,
+			dropout=probe_dropout,
+			use_activation_checkpointing=use_activation_checkpointing,
+		)
+
+	def forward(self, x, return_features: bool = False):
+		tokens = self.encoder(x)
+		if return_features:
+			logits, probe_feats = self.probe(tokens, return_features=True)
+			return logits, tokens, probe_feats
+		return self.probe(tokens)
 
 
 class MViT_Spatial(nn.Module):
@@ -154,6 +254,85 @@ def reshape_temporal_features(token_feats: torch.Tensor, clip_length: int):
 			token_feats.shape[0], clip_length, tokens_per_frame, token_feats.shape[-1]
 		).mean(dim=2)
 	return token_feats
+
+
+def build_ek100_multitask_label_maps(train_csv: str):
+	verb_set = set()
+	noun_set = set()
+	action_set = set()
+
+	with open(train_csv) as f:
+		csv_reader = csv.reader(f)
+		_ = next(csv_reader)
+		for row in csv_reader:
+			verb = int(row[10])
+			noun = int(row[12])
+			verb_set.add(str(verb))
+			noun_set.add(str(noun))
+			action_set.add(f"{verb}:{noun}")
+
+	verb_list = sorted(verb_set, key=int)
+	noun_list = sorted(noun_set, key=int)
+	action_list = sorted(action_set, key=lambda vn: (int(vn.split(":")[0]), int(vn.split(":")[1])))
+
+	verb_map = {v: i for i, v in enumerate(verb_list)}
+	noun_map = {n: i for i, n in enumerate(noun_list)}
+	action_map = {a: i for i, a in enumerate(action_list)}
+
+	return dict(verb=verb_map, noun=noun_map, action=action_map)
+
+
+class EK100MultiTaskDataset(VideoCaptionDatasetBase):
+	def __init__(
+		self,
+		args,
+		root: str,
+		metadata: str,
+		transform=None,
+		is_training: bool = True,
+		label_maps=None,
+		filter_actions: bool = False,
+		clip_length: int = 32,
+		clip_stride: int = 2,
+		sparse_sample: bool = False,
+	):
+		super().__init__(args, "ek100_cls", root, metadata)
+		self.transform = transform
+		self.is_training = is_training
+		self.label_maps = label_maps
+		self.clip_length = clip_length
+		self.clip_stride = clip_stride
+		self.sparse_sample = sparse_sample
+
+		if filter_actions and self.label_maps is not None:
+			before = len(self.samples)
+			filtered = []
+			for sample in self.samples:
+				verb = str(sample[4])
+				noun = str(sample[5])
+				if f"{verb}:{noun}" in self.label_maps["action"]:
+					filtered.append(sample)
+			self.samples = filtered
+			dropped = before - len(self.samples)
+			if dropped > 0:
+				print(f"=> Filtered {dropped} validation samples with unseen actions")
+
+	def __getitem__(self, i):
+		vid_path, start_frame, end_frame, _, verb, noun = self.samples[i]
+		frame_ids = get_frame_ids(start_frame, end_frame, num_segments=self.clip_length, jitter=self.is_training)
+		frames = video_loader_by_frames(self.root, vid_path, frame_ids)
+
+		if self.transform is not None:
+			frames = self.transform(frames)
+
+		verb_key = str(verb)
+		noun_key = str(noun)
+		action_key = f"{verb_key}:{noun_key}"
+		verb_label = self.label_maps["verb"][verb_key]
+		noun_label = self.label_maps["noun"][noun_key]
+		action_label = self.label_maps["action"][action_key]
+
+		return frames, verb_label, noun_label, action_label
 
 
 def build_transforms(args):
@@ -224,9 +403,14 @@ def compute_flow_sequence(images, images_flow, flow_model, args):
 def forward_with_features(model, model_type, activation, inputs, args):
 	"""Run model forward pass and return logits, token features and cls features."""
 	if model_type in VJEPA2_MODEL_SPECS:
-		logits, tokens, pooled = model(inputs, return_features=True)
-		feat = reshape_temporal_features(tokens, args.clip_length)
-		cls_feat = pooled
+		if args.multi_task:
+			logits, tokens, probe_feats = model(inputs, return_features=True)
+			feat = reshape_temporal_features(tokens, args.clip_length)
+			cls_feat = probe_feats
+		else:
+			logits, tokens, pooled = model(inputs, return_features=True)
+			feat = reshape_temporal_features(tokens, args.clip_length)
+			cls_feat = pooled
 	else:
 		logits = model(inputs)
 		token_output = activation['tokens']
@@ -236,11 +420,22 @@ def forward_with_features(model, model_type, activation, inputs, args):
 	return logits, feat, cls_feat
 
 
-def extract_split(loader, model, flow_model, args, subset: str):
+def extract_split(loader, model, flow_model, args, subset: str, head: str = None):
 	"""Extract features for a single split and save to disk."""
+	if args.multi_task:
+		if head is None:
+			raise ValueError("Multi-task extraction requires a head name.")
+		if head not in {"verb", "noun", "action"}:
+			raise ValueError(f"Unknown multi-task head: {head}")
+		if args.model_type == 'mvit_temporal':
+			raise ValueError("Multi-task extraction is not supported for temporal flow models.")
 	batch_time = AverageMeter('Time', ':6.2f')
 	data_time = AverageMeter('Data', ':6.2f')
-	progress = ProgressMeter(len(loader), [batch_time, data_time], prefix=f'{subset}: ')
+	if args.multi_task:
+		progress_prefix = f'{subset}-{head}: '
+	else:
+		progress_prefix = f'{subset}: '
+	progress = ProgressMeter(len(loader), [batch_time, data_time], prefix=progress_prefix)
 
 	model.eval()
 	if args.use_half:
@@ -295,7 +490,16 @@ def extract_split(loader, model, flow_model, args, subset: str):
 					all_cls_feats.append(cls_feat.detach().cpu())
 				all_targets.append(target_gpu.detach().cpu())
 			else:
-				images, target = batch_data
+				if args.multi_task:
+					images, verb_target, noun_target, action_target = batch_data
+					target_map = {
+						"verb": verb_target,
+						"noun": noun_target,
+						"action": action_target,
+					}
+					target = target_map[head]
+				else:
+					images, target = batch_data
 				target_gpu = target.cuda(args.gpu, non_blocking=True)
 				if isinstance(images, list):
 					logits_crops, feats_crops, cls_crops = [], [], []
@@ -306,6 +510,9 @@ def extract_split(loader, model, flow_model, args, subset: str):
 						logits, feat, cls_feat = forward_with_features(
 							model, args.model_type, activation, crop, args
 						)
+						if args.multi_task:
+							logits = logits[head]
+							cls_feat = cls_feat[head]
 						logits_crops.append(logits.unsqueeze(1).detach().cpu())
 						feats_crops.append(feat.unsqueeze(1).detach().cpu())
 						cls_crops.append(cls_feat.unsqueeze(1).detach().cpu())
@@ -319,6 +526,9 @@ def extract_split(loader, model, flow_model, args, subset: str):
 					logits, feat, cls_feat = forward_with_features(
 						model, args.model_type, activation, images, args
 					)
+					if args.multi_task:
+						logits = logits[head]
+						cls_feat = cls_feat[head]
 					all_outputs.append(logits.detach().cpu())
 					all_feats.append(feat.detach().cpu())
 					all_cls_feats.append(cls_feat.detach().cpu())
@@ -338,7 +548,10 @@ def extract_split(loader, model, flow_model, args, subset: str):
 	all_outputs = torch.cat(all_outputs)
 	all_targets = torch.cat(all_targets)
 
-	save_name = f"{args.dataset}_{subset}_feat.pt"
+	if args.multi_task:
+		save_name = f"{args.dataset}_{subset}_{head}_feat.pt"
+	else:
+		save_name = f"{args.dataset}_{subset}_feat.pt"
 	save_path = os.path.join(args.output_dir, save_name)
 	torch.save({
 		'feats': all_feats,
@@ -347,7 +560,10 @@ def extract_split(loader, model, flow_model, args, subset: str):
 		'targets': all_targets,
 	}, save_path)
 
-	print(f"Saved {subset} features to {save_path}")
+	if args.multi_task:
+		print(f"Saved {subset} {head} features to {save_path}")
+	else:
+		print(f"Saved {subset} features to {save_path}")
 	print(f"  feats: {all_feats.shape}")
 	print(f"  cls_feats: {all_cls_feats.shape}")
 	print(f"  outputs: {all_outputs.shape}")
@@ -360,6 +576,8 @@ def get_args_parser():
 	# Data
 	parser.add_argument('--dataset', default='egtea', type=str, choices=['ek100_cls', 'egtea'])
 	parser.add_argument('--task-type', default='action', type=str, choices=['action', 'verb', 'noun'])
+	parser.add_argument('--multi-task', action='store_true',
+						help='extract verb/noun/action probe features jointly (EK100 + V-JEPA2 only)')
 	parser.add_argument('--ek100-train-csv',
 						default='/home/dz/Projects/multi-modal_AR/data/EK/data/EPIC_100_train.csv',
 						type=str, help='path to EK100 train csv for label map')
@@ -396,6 +614,16 @@ def get_args_parser():
 	parser.add_argument('--dropout-ratio', default=0.5, type=float, help='dropout ratio in classifier head')
 	parser.add_argument('--num-classes', default=None, type=int, help='override class count (otherwise inferred)')
 	parser.add_argument('--use-half', action='store_true', help='use half precision at inference')
+	parser.add_argument('--probe-num-heads', default=16, type=int,
+						help='attention heads in attentive probe (V-JEPA2)')
+	parser.add_argument('--probe-num-blocks', default=4, type=int,
+						help='attentive probe depth (V-JEPA2)')
+	parser.add_argument('--probe-mlp-ratio', default=4.0, type=float,
+						help='attentive probe MLP ratio (V-JEPA2)')
+	parser.add_argument('--probe-dropout', default=0.0, type=float,
+						help='dropout before classifier in probe head (V-JEPA2)')
+	parser.add_argument('--probe-use-activation-checkpointing', action='store_true',
+						help='enable activation checkpointing in attentive probe')
 
 	# System
 	parser.add_argument('--print-freq', default=50, type=int, help='print frequency')
@@ -419,26 +647,46 @@ def main(args):
 	random_seed(args.seed, dist_utils.get_rank())
 	print(f'Random seed: {args.seed}')
 
-	# Infer number of classes if not provided
-	if args.num_classes is None:
-		if args.dataset == 'egtea':
-			if args.task_type == 'action':
-				args.num_classes = 106
-			elif args.task_type == 'verb':
-				args.num_classes = 19
-			elif args.task_type == 'noun':
-				args.num_classes = 53
-		elif args.dataset == 'ek100_cls':
-			if args.task_type == 'action':
-				args.num_classes = 3806
-			elif args.task_type == 'verb':
-				args.num_classes = 97
-			elif args.task_type == 'noun':
-				args.num_classes = 300
-	print(f"Using {args.num_classes} classes for task {args.task_type}")
+	label_maps = None
+	if args.multi_task:
+		if args.dataset != 'ek100_cls':
+			raise ValueError("Multi-task extraction is only supported for EK100.")
+		if args.model_type not in VJEPA2_MODEL_SPECS:
+			raise ValueError("Multi-task extraction is only supported for V-JEPA2 models.")
+		train_csv = args.ek100_train_csv
+		if not os.path.exists(train_csv):
+			train_csv = args.metadata_train
+			print(f"=> Using metadata_train for label maps: {train_csv}")
+		label_maps = build_ek100_multitask_label_maps(train_csv)
+		args.num_classes_action = len(label_maps["action"])
+		args.num_classes_verb = len(label_maps["verb"])
+		args.num_classes_noun = len(label_maps["noun"])
+		args.num_classes = args.num_classes_action
+		print(
+			"Using multi-task classes (action/verb/noun): "
+			f"{args.num_classes_action}/{args.num_classes_verb}/{args.num_classes_noun}"
+		)
+	else:
+		# Infer number of classes if not provided
+		if args.num_classes is None:
+			if args.dataset == 'egtea':
+				if args.task_type == 'action':
+					args.num_classes = 106
+				elif args.task_type == 'verb':
+					args.num_classes = 19
+				elif args.task_type == 'noun':
+					args.num_classes = 53
+			elif args.dataset == 'ek100_cls':
+				if args.task_type == 'action':
+					args.num_classes = 3806
+				elif args.task_type == 'verb':
+					args.num_classes = 97
+				elif args.task_type == 'noun':
+					args.num_classes = 300
+		print(f"Using {args.num_classes} classes for task {args.task_type}")
 
 	# This flag controls label selection inside dataset
-	args.egtea_finetune_type = args.task_type
+	args.egtea_finetune_type = 'action' if args.multi_task else args.task_type
 
 	# Build model
 	if args.model_type == 'mvit_spatial':
@@ -446,7 +694,20 @@ def main(args):
 	elif args.model_type == 'mvit_temporal':
 		model = MViT_Temporal(args.num_classes, dropout=args.dropout_ratio)
 	elif args.model_type in VJEPA2_MODEL_SPECS:
-		model = VJEPA2FeatureExtractor(args.model_type, args.num_classes, dropout=args.dropout_ratio)
+		if args.multi_task:
+			model = VJEPA2MultiTaskProbeClassifier(
+				args.model_type,
+				num_verb_classes=args.num_classes_verb,
+				num_noun_classes=args.num_classes_noun,
+				num_action_classes=args.num_classes_action,
+				probe_num_heads=args.probe_num_heads,
+				probe_num_blocks=args.probe_num_blocks,
+				probe_mlp_ratio=args.probe_mlp_ratio,
+				probe_dropout=args.probe_dropout,
+				use_activation_checkpointing=args.probe_use_activation_checkpointing,
+			)
+		else:
+			model = VJEPA2FeatureExtractor(args.model_type, args.num_classes, dropout=args.dropout_ratio)
 	else:
 		raise ValueError(f'Unknown model type: {args.model_type}')
 
@@ -484,12 +745,27 @@ def main(args):
 	# Data transforms and datasets
 	train_transform, val_transform, crop_size = build_transforms(args)
 	tokenizer = SimpleTokenizer()
-	_, mapping_vn2act = generate_label_map(args.dataset, args)
+	mapping_vn2act = None
+	if not args.multi_task:
+		_, mapping_vn2act = generate_label_map(args.dataset, args)
 
 	num_clips_at_val = args.num_clips
 	args.num_clips = 1
 	args.num_crops = 3
-	if args.model_type == 'mvit_temporal':
+	if args.multi_task:
+		train_dataset = EK100MultiTaskDataset(
+			args,
+			args.root,
+			args.metadata_train,
+			transform=train_transform,
+			is_training=True,
+			label_maps=label_maps,
+			filter_actions=False,
+			clip_length=args.clip_length,
+			clip_stride=args.clip_stride,
+			sparse_sample=args.sparse_sample,
+		)
+	elif args.model_type == 'mvit_temporal':
 		train_dataset = datasets_flow.get_downstream_dataset_extract(
 			train_transform, tokenizer, args, subset='train', label_mapping=mapping_vn2act,
 		)
@@ -499,7 +775,20 @@ def main(args):
 		)
 	args.num_clips = num_clips_at_val
 	args.num_crops = 1
-	if args.model_type == 'mvit_temporal':
+	if args.multi_task:
+		val_dataset = EK100MultiTaskDataset(
+			args,
+			args.root,
+			args.metadata_val,
+			transform=val_transform,
+			is_training=False,
+			label_maps=label_maps,
+			filter_actions=True,
+			clip_length=args.clip_length,
+			clip_stride=args.clip_stride,
+			sparse_sample=args.sparse_sample,
+		)
+	elif args.model_type == 'mvit_temporal':
 		val_dataset = datasets_flow.get_downstream_dataset_extract(
 			val_transform, tokenizer, args, subset='val', label_mapping=mapping_vn2act,
 		)
@@ -530,8 +819,14 @@ def main(args):
 	cudnn.benchmark = True
 
 	# Extract features
-	extract_split(train_loader, model, flow_model, args, subset='train')
-	extract_split(val_loader, model, flow_model, args, subset='test')
+	if args.multi_task:
+		extract_split(train_loader, model, flow_model, args, subset='train', head='verb')
+		extract_split(train_loader, model, flow_model, args, subset='train', head='noun')
+		extract_split(val_loader, model, flow_model, args, subset='test', head='verb')
+		extract_split(val_loader, model, flow_model, args, subset='test', head='noun')
+	else:
+		extract_split(train_loader, model, flow_model, args, subset='train')
+		extract_split(val_loader, model, flow_model, args, subset='test')
 
 
 if __name__ == '__main__':
