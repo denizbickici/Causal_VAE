@@ -74,6 +74,20 @@ def _get_vjepa2_attentive_pooler():
     return AttentivePooler
 
 
+def _get_sigmoid_focal_loss():
+    vjepa2_root = os.path.join(os.path.dirname(__file__), "thirdparty", "vjepa2")
+    if os.path.isdir(vjepa2_root) and vjepa2_root not in sys.path:
+        sys.path.append(vjepa2_root)
+    try:
+        from evals.action_anticipation_frozen.losses import sigmoid_focal_loss
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to import V-JEPA2 sigmoid focal loss. "
+            "Ensure thirdparty/vjepa2 is present and on the Python path."
+        ) from exc
+    return sigmoid_focal_loss
+
+
 def _load_vjepa2_encoder(variant_key):
     if variant_key not in VJEPA2_MODEL_SPECS:
         raise ValueError(f'Unsupported V-JEPA2 variant: {variant_key}')
@@ -415,6 +429,8 @@ def get_args_parser():
     parser.add_argument('--class-weight', default='none', type=str,
                         choices=['none', 'balanced'],
                         help='use class-balanced weights for cross-entropy')
+    parser.add_argument('--use-focal-loss', action='store_true',
+                        help='use V-JEPA2 sigmoid focal loss instead of cross-entropy')
     parser.add_argument('--verb-loss-weight', default=1.0, type=float,
                         help='loss weight for verb head (multi-task)')
     parser.add_argument('--noun-loss-weight', default=1.0, type=float,
@@ -1298,41 +1314,51 @@ def main(args):
     print(f'Validation batches: {len(val_loader)}')
 
     # Create loss function (optionally class-balanced)
-    if args.multi_task:
-        if args.class_weight == 'balanced':
-            class_weights = compute_multitask_class_weights(train_dataset, label_maps)
-            if dist_utils.is_main_process():
-                print('=> Using balanced class weights for multi-task cross-entropy')
-            criterion = {
-                "verb": nn.CrossEntropyLoss(
-                    weight=class_weights["verb"].cuda(args.gpu),
-                    label_smoothing=args.label_smoothing,
-                ).cuda(args.gpu),
-                "noun": nn.CrossEntropyLoss(
-                    weight=class_weights["noun"].cuda(args.gpu),
-                    label_smoothing=args.label_smoothing,
-                ).cuda(args.gpu),
-                "action": nn.CrossEntropyLoss(
-                    weight=class_weights["action"].cuda(args.gpu),
-                    label_smoothing=args.label_smoothing,
-                ).cuda(args.gpu),
-            }
+    if args.use_focal_loss:
+        if dist_utils.is_main_process():
+            if args.class_weight != 'none' or args.label_smoothing > 0:
+                print("=> Using focal loss; ignoring class weights and label smoothing.")
+        focal_loss = _get_sigmoid_focal_loss()
+        if args.multi_task:
+            criterion = {"verb": focal_loss, "noun": focal_loss, "action": focal_loss}
         else:
-            criterion = {
-                "verb": nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).cuda(args.gpu),
-                "noun": nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).cuda(args.gpu),
-                "action": nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).cuda(args.gpu),
-            }
+            criterion = focal_loss
     else:
-        if args.class_weight == 'balanced':
-            class_weights = compute_class_weights(args, train_dataset, mapping_vn2act)
-            if dist_utils.is_main_process():
-                print('=> Using balanced class weights for cross-entropy '
-                      f'(min={class_weights.min().item():.4f}, max={class_weights.max().item():.4f})')
-            class_weights = class_weights.cuda(args.gpu)
-            criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=args.label_smoothing).cuda(args.gpu)
+        if args.multi_task:
+            if args.class_weight == 'balanced':
+                class_weights = compute_multitask_class_weights(train_dataset, label_maps)
+                if dist_utils.is_main_process():
+                    print('=> Using balanced class weights for multi-task cross-entropy')
+                criterion = {
+                    "verb": nn.CrossEntropyLoss(
+                        weight=class_weights["verb"].cuda(args.gpu),
+                        label_smoothing=args.label_smoothing,
+                    ).cuda(args.gpu),
+                    "noun": nn.CrossEntropyLoss(
+                        weight=class_weights["noun"].cuda(args.gpu),
+                        label_smoothing=args.label_smoothing,
+                    ).cuda(args.gpu),
+                    "action": nn.CrossEntropyLoss(
+                        weight=class_weights["action"].cuda(args.gpu),
+                        label_smoothing=args.label_smoothing,
+                    ).cuda(args.gpu),
+                }
+            else:
+                criterion = {
+                    "verb": nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).cuda(args.gpu),
+                    "noun": nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).cuda(args.gpu),
+                    "action": nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).cuda(args.gpu),
+                }
         else:
-            criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).cuda(args.gpu)
+            if args.class_weight == 'balanced':
+                class_weights = compute_class_weights(args, train_dataset, mapping_vn2act)
+                if dist_utils.is_main_process():
+                    print('=> Using balanced class weights for cross-entropy '
+                          f'(min={class_weights.min().item():.4f}, max={class_weights.max().item():.4f})')
+                class_weights = class_weights.cuda(args.gpu)
+                criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=args.label_smoothing).cuda(args.gpu)
+            else:
+                criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).cuda(args.gpu)
     
     # Learning rate schedule
     lr_schedule = cosine_scheduler(
