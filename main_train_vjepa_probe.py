@@ -14,6 +14,7 @@ import argparse
 from collections import OrderedDict
 import csv
 import json
+import math
 import numpy as np
 import os
 import sys
@@ -86,6 +87,114 @@ def _get_sigmoid_focal_loss():
             "Ensure thirdparty/vjepa2 is present and on the Python path."
         ) from exc
     return sigmoid_focal_loss
+
+
+def build_default_multihead_kwargs():
+    lrs = [0.005, 0.003, 0.001, 0.0003, 0.0001]
+    wds = [0.0001, 0.001, 0.01, 0.1]
+    return [
+        dict(
+            weight_decay=wd,
+            final_weight_decay=wd,
+            lr=lr,
+            start_lr=lr,
+            final_lr=0.0,
+            warmup=0.0,
+        )
+        for wd in wds
+        for lr in lrs
+    ]
+
+
+def load_multihead_kwargs(config_path):
+    if not config_path:
+        return build_default_multihead_kwargs()
+
+    with open(config_path, "r") as handle:
+        if config_path.endswith(".json"):
+            data = json.load(handle)
+        else:
+            try:
+                import yaml
+            except ImportError as exc:
+                raise RuntimeError("PyYAML is required to load non-JSON multihead configs.") from exc
+            data = yaml.safe_load(handle)
+
+    if isinstance(data, dict) and "multihead_kwargs" in data:
+        data = data["multihead_kwargs"]
+    if not isinstance(data, list):
+        raise ValueError("Multihead config must be a list of optimizer kwargs.")
+    return data
+
+
+class WarmupCosineLRSchedule(object):
+
+    def __init__(self, optimizer, T_max):
+        self.optimizer = optimizer
+        self.T_max = T_max
+        self._step = 0.0
+
+    def step(self):
+        self._step += 1
+        for group in self.optimizer.param_groups:
+            ref_lr = group.get("mc_ref_lr")
+            final_lr = group.get("mc_final_lr")
+            start_lr = group.get("mc_start_lr")
+            warmup_steps = group.get("mc_warmup_steps")
+            T_max = self.T_max - warmup_steps
+            if self._step < warmup_steps:
+                progress = float(self._step) / float(max(1, warmup_steps))
+                new_lr = start_lr + progress * (ref_lr - start_lr)
+            else:
+                progress = float(self._step - warmup_steps) / float(max(1, T_max))
+                new_lr = max(
+                    final_lr,
+                    final_lr + (ref_lr - final_lr) * 0.5 * (1.0 + math.cos(math.pi * progress)),
+                )
+            group["lr"] = new_lr
+
+
+class CosineWDSchedule(object):
+
+    def __init__(self, optimizer, T_max):
+        self.optimizer = optimizer
+        self.T_max = T_max
+        self._step = 0.0
+
+    def step(self):
+        self._step += 1
+        progress = self._step / self.T_max
+
+        for group in self.optimizer.param_groups:
+            ref_wd = group.get("mc_ref_wd")
+            final_wd = group.get("mc_final_wd")
+            new_wd = final_wd + (ref_wd - final_wd) * 0.5 * (1.0 + math.cos(math.pi * progress))
+            if final_wd <= ref_wd:
+                new_wd = max(final_wd, new_wd)
+            else:
+                new_wd = min(final_wd, new_wd)
+            group["weight_decay"] = new_wd
+
+
+def init_multihead_opt(classifiers, iterations_per_epoch, opt_kwargs, num_epochs, use_scaler=False):
+    optimizers, schedulers, wd_schedulers, scalers = [], [], [], []
+    for c, kwargs in zip(classifiers, opt_kwargs):
+        param_groups = [
+            {
+                "params": (p for _, p in c.named_parameters()),
+                "mc_warmup_steps": int(kwargs.get("warmup", 0.0) * iterations_per_epoch),
+                "mc_start_lr": kwargs.get("start_lr"),
+                "mc_ref_lr": kwargs.get("lr"),
+                "mc_final_lr": kwargs.get("final_lr"),
+                "mc_ref_wd": kwargs.get("weight_decay"),
+                "mc_final_wd": kwargs.get("final_weight_decay"),
+            }
+        ]
+        optimizers.append(torch.optim.AdamW(param_groups))
+        schedulers.append(WarmupCosineLRSchedule(optimizers[-1], T_max=int(num_epochs * iterations_per_epoch)))
+        wd_schedulers.append(CosineWDSchedule(optimizers[-1], T_max=int(num_epochs * iterations_per_epoch)))
+        scalers.append(torch.cuda.amp.GradScaler() if use_scaler else None)
+    return optimizers, scalers, schedulers, wd_schedulers
 
 
 def _load_vjepa2_encoder(variant_key):
@@ -431,6 +540,14 @@ def get_args_parser():
                         help='use class-balanced weights for cross-entropy')
     parser.add_argument('--use-focal-loss', action='store_true',
                         help='use V-JEPA2 sigmoid focal loss instead of cross-entropy')
+    parser.add_argument('--multihead-sweep', action='store_true',
+                        help='train multiple probe heads with V-JEPA2 schedulers')
+    parser.add_argument('--multihead-config', default='', type=str,
+                        help='path to JSON/YAML file with multihead optimizer kwargs')
+    parser.add_argument('--multihead-max-heads', default=0, type=int,
+                        help='limit number of multihead probes (0 = all)')
+    parser.add_argument('--use-bfloat16', action='store_true',
+                        help='use bfloat16 autocast in multihead sweep')
     parser.add_argument('--verb-loss-weight', default=1.0, type=float,
                         help='loss weight for verb head (multi-task)')
     parser.add_argument('--noun-loss-weight', default=1.0, type=float,
@@ -494,6 +611,78 @@ def save_checkpoint(state, is_best, output_dir):
     if is_best:
         best_path = os.path.join(output_dir, 'checkpoint_best.pt')
         torch.save(state, best_path)
+
+
+def _unwrap_ddp(module):
+    if isinstance(module, torch.nn.parallel.DistributedDataParallel):
+        return module.module
+    return module
+
+
+def build_probe_state_dict(encoder, probe):
+    state_dict = {}
+    for k, v in encoder.state_dict().items():
+        state_dict[f"encoder.{k}"] = v
+    for k, v in probe.state_dict().items():
+        state_dict[f"probe.{k}"] = v
+    return state_dict
+
+
+def load_multihead_checkpoint(checkpoint_path, encoder, classifiers, optimizers, scalers):
+    if checkpoint_path.endswith('.safetensors'):
+        raise ValueError("Multihead checkpoints must be .pt/.pth files.")
+    print(f"=> Loading multihead checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    start_epoch = checkpoint.get('epoch', 0)
+    best_acc1 = checkpoint.get('best_acc1', 0.0)
+    best_head_idx = checkpoint.get('best_head_idx', 0)
+    if classifiers and best_head_idx >= len(classifiers):
+        print(
+            f"Warning: best_head_idx {best_head_idx} exceeds {len(classifiers)} heads; "
+            "resetting to 0."
+        )
+        best_head_idx = 0
+
+    if 'encoder_state_dict' in checkpoint:
+        missing_keys, unexpected_keys = encoder.load_state_dict(
+            checkpoint['encoder_state_dict'], strict=False
+        )
+        if missing_keys:
+            print(f"Missing encoder keys: {missing_keys}")
+        if unexpected_keys:
+            print(f"Unexpected encoder keys: {unexpected_keys}")
+
+    classifier_states = checkpoint.get('classifiers')
+    if classifier_states:
+        for c, sd in zip(classifiers, classifier_states):
+            _unwrap_ddp(c).load_state_dict(sd, strict=False)
+        if len(classifier_states) != len(classifiers):
+            print(
+                f"Warning: checkpoint has {len(classifier_states)} heads, "
+                f"but {len(classifiers)} heads are initialized."
+            )
+    elif 'state_dict' in checkpoint:
+        # Fallback for single-head checkpoints with encoder/probe prefixes
+        state_dict = checkpoint['state_dict']
+        if isinstance(state_dict, dict):
+            enc_state = {k[len("encoder."):]: v for k, v in state_dict.items() if k.startswith("encoder.")}
+            probe_state = {k[len("probe."):]: v for k, v in state_dict.items() if k.startswith("probe.")}
+            if enc_state:
+                encoder.load_state_dict(enc_state, strict=False)
+            if probe_state and classifiers:
+                _unwrap_ddp(classifiers[0]).load_state_dict(probe_state, strict=False)
+
+    opt_states = checkpoint.get('optimizers') or checkpoint.get('opt')
+    if opt_states:
+        for opt, sd in zip(optimizers, opt_states):
+            opt.load_state_dict(sd)
+
+    scaler_states = checkpoint.get('scalers') or checkpoint.get('scaler')
+    if scaler_states and scalers and all(s is not None for s in scalers):
+        for sc, sd in zip(scalers, scaler_states):
+            sc.load_state_dict(sd)
+
+    return start_epoch, best_acc1, best_head_idx
 
 
 def compute_class_weights(args, train_dataset, label_mapping):
@@ -797,6 +986,286 @@ def train(train_loader, model, flow_model, criterion, optimizer, scaler, epoch, 
             'lr': optimizer.param_groups[0]['lr']}
 
 
+def train_multihead_epoch(
+    train_loader,
+    encoder,
+    classifiers,
+    criterion,
+    optimizers,
+    scalers,
+    schedulers,
+    wd_schedulers,
+    epoch,
+    args,
+):
+    batch_time = AverageMeter('Time', ':6.2f')
+    data_time = AverageMeter('Data', ':6.2f')
+    losses = AverageMeter('Loss', ':.4e')
+    mem = AverageMeter('Mem (GB)', ':6.1f')
+
+    if args.multi_task:
+        top1_action = AverageMeter('Acc@1-A', ':6.2f')
+        top1_verb = AverageMeter('Acc@1-V', ':6.2f')
+        top1_noun = AverageMeter('Acc@1-N', ':6.2f')
+        top5_action = AverageMeter('Acc@5-A', ':6.2f')
+        top5_verb = AverageMeter('Acc@5-V', ':6.2f')
+        top5_noun = AverageMeter('Acc@5-N', ':6.2f')
+        meters = [batch_time, data_time, losses, top1_action, top1_verb, top1_noun, top5_action, top5_verb, top5_noun, mem]
+        per_head_top1_action = [AverageMeter() for _ in classifiers]
+        per_head_top1_verb = [AverageMeter() for _ in classifiers]
+        per_head_top1_noun = [AverageMeter() for _ in classifiers]
+        per_head_top5_action = [AverageMeter() for _ in classifiers]
+        per_head_top5_verb = [AverageMeter() for _ in classifiers]
+        per_head_top5_noun = [AverageMeter() for _ in classifiers]
+    else:
+        top1 = AverageMeter('Acc@1', ':6.2f')
+        top5 = AverageMeter('Acc@5', ':6.2f')
+        meters = [batch_time, data_time, losses, top1, top5, mem]
+        per_head_top1 = [AverageMeter() for _ in classifiers]
+        per_head_top5 = [AverageMeter() for _ in classifiers]
+
+    progress = ProgressMeter(len(train_loader), meters, prefix="Epoch: [{}]".format(epoch))
+
+    encoder.eval()
+    for c in classifiers:
+        c.train()
+
+    amp_enabled = args.use_bfloat16 and not args.disable_amp
+    amp_dtype = torch.bfloat16
+    use_scaler = amp_enabled
+
+    end = time.time()
+    for data_iter, batch_data in enumerate(train_loader):
+        data_time.update(time.time() - end)
+
+        [s.step() for s in schedulers]
+        [wds.step() for wds in wd_schedulers]
+
+        if args.model_type == 'mvit_temporal':
+            raise ValueError("Multihead sweep is not supported for temporal flow models.")
+
+        if args.multi_task:
+            images, verb_target, noun_target, action_target = batch_data
+            verb_target = verb_target.cuda(args.gpu, non_blocking=True)
+            noun_target = noun_target.cuda(args.gpu, non_blocking=True)
+            action_target = action_target.cuda(args.gpu, non_blocking=True)
+        else:
+            images, target = batch_data
+            target = target.cuda(args.gpu, non_blocking=True)
+
+        images = images.cuda(args.gpu, non_blocking=True)
+
+        with amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+            with torch.no_grad():
+                tokens = encoder(images)
+            outputs = [c(tokens) for c in classifiers]
+
+            if args.multi_task:
+                losses_list = []
+                for o in outputs:
+                    loss_verb = criterion["verb"](o["verb"], verb_target)
+                    loss_noun = criterion["noun"](o["noun"], noun_target)
+                    loss_action = criterion["action"](o["action"], action_target)
+                    total_loss = (
+                        args.verb_loss_weight * loss_verb
+                        + args.noun_loss_weight * loss_noun
+                        + args.action_loss_weight * loss_action
+                    )
+                    losses_list.append(total_loss)
+            else:
+                losses_list = [criterion(o, target) for o in outputs]
+
+        if use_scaler:
+            [s.scale(l).backward() for s, l in zip(scalers, losses_list)]
+            [s.step(o) for s, o in zip(scalers, optimizers)]
+            [s.update() for s in scalers]
+        else:
+            [l.backward() for l in losses_list]
+            [o.step() for o in optimizers]
+        [o.zero_grad() for o in optimizers]
+
+        batch_size = images.size(0)
+        loss_value = sum([l.item() for l in losses_list]) / max(len(losses_list), 1)
+        losses.update(loss_value, batch_size)
+
+        with torch.no_grad():
+            if args.multi_task:
+                action_accs = [accuracy(o["action"], action_target, topk=(1, 5)) for o in outputs]
+                verb_accs = [accuracy(o["verb"], verb_target, topk=(1, 5)) for o in outputs]
+                noun_accs = [accuracy(o["noun"], noun_target, topk=(1, 5)) for o in outputs]
+
+                for meter, acc in zip(per_head_top1_action, action_accs):
+                    meter.update(acc[0].item(), batch_size)
+                for meter, acc in zip(per_head_top5_action, action_accs):
+                    meter.update(acc[1].item(), batch_size)
+                for meter, acc in zip(per_head_top1_verb, verb_accs):
+                    meter.update(acc[0].item(), batch_size)
+                for meter, acc in zip(per_head_top5_verb, verb_accs):
+                    meter.update(acc[1].item(), batch_size)
+                for meter, acc in zip(per_head_top1_noun, noun_accs):
+                    meter.update(acc[0].item(), batch_size)
+                for meter, acc in zip(per_head_top5_noun, noun_accs):
+                    meter.update(acc[1].item(), batch_size)
+
+                top1_action.update(max([a[0].item() for a in action_accs]), batch_size)
+                top1_verb.update(max([a[0].item() for a in verb_accs]), batch_size)
+                top1_noun.update(max([a[0].item() for a in noun_accs]), batch_size)
+                top5_action.update(max([a[1].item() for a in action_accs]), batch_size)
+                top5_verb.update(max([a[1].item() for a in verb_accs]), batch_size)
+                top5_noun.update(max([a[1].item() for a in noun_accs]), batch_size)
+            else:
+                accs = [accuracy(o, target, topk=(1, 5)) for o in outputs]
+                for meter, acc in zip(per_head_top1, accs):
+                    meter.update(acc[0].item(), batch_size)
+                for meter, acc in zip(per_head_top5, accs):
+                    meter.update(acc[1].item(), batch_size)
+                top1.update(max([a[0].item() for a in accs]), batch_size)
+                top5.update(max([a[1].item() for a in accs]), batch_size)
+
+        mem.update(torch.cuda.max_memory_allocated() // 1e9)
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if data_iter % args.print_freq == 0:
+            progress.display(data_iter)
+
+    if args.multi_task:
+        ret = {
+            'loss': losses.avg,
+            'acc1_action': max([m.avg for m in per_head_top1_action]),
+            'acc1_verb': max([m.avg for m in per_head_top1_verb]),
+            'acc1_noun': max([m.avg for m in per_head_top1_noun]),
+            'acc5_action': max([m.avg for m in per_head_top5_action]),
+            'acc5_verb': max([m.avg for m in per_head_top5_verb]),
+            'acc5_noun': max([m.avg for m in per_head_top5_noun]),
+            'lr': max([o.param_groups[0]['lr'] for o in optimizers]),
+        }
+    else:
+        ret = {
+            'loss': losses.avg,
+            'acc1': max([m.avg for m in per_head_top1]),
+            'acc5': max([m.avg for m in per_head_top5]),
+            'lr': max([o.param_groups[0]['lr'] for o in optimizers]),
+        }
+    return ret
+
+
+@torch.no_grad()
+def validate_multihead(val_loader, encoder, classifiers, args):
+    batch_time = AverageMeter('Time', ':6.2f')
+    if args.multi_task:
+        top1_action = AverageMeter('Acc@1-A', ':6.2f')
+        top1_verb = AverageMeter('Acc@1-V', ':6.2f')
+        top1_noun = AverageMeter('Acc@1-N', ':6.2f')
+        top5_action = AverageMeter('Acc@5-A', ':6.2f')
+        top5_verb = AverageMeter('Acc@5-V', ':6.2f')
+        top5_noun = AverageMeter('Acc@5-N', ':6.2f')
+        meters = [batch_time, top1_action, top1_verb, top1_noun, top5_action, top5_verb, top5_noun]
+        per_head_top1_action = [AverageMeter() for _ in classifiers]
+        per_head_top1_verb = [AverageMeter() for _ in classifiers]
+        per_head_top1_noun = [AverageMeter() for _ in classifiers]
+        per_head_top5_action = [AverageMeter() for _ in classifiers]
+        per_head_top5_verb = [AverageMeter() for _ in classifiers]
+        per_head_top5_noun = [AverageMeter() for _ in classifiers]
+    else:
+        top1 = AverageMeter('Acc@1', ':6.2f')
+        top5 = AverageMeter('Acc@5', ':6.2f')
+        meters = [batch_time, top1, top5]
+        per_head_top1 = [AverageMeter() for _ in classifiers]
+        per_head_top5 = [AverageMeter() for _ in classifiers]
+
+    progress = ProgressMeter(len(val_loader), meters, prefix='Test: ')
+
+    encoder.eval()
+    for c in classifiers:
+        c.eval()
+
+    amp_enabled = args.use_bfloat16 and not args.disable_amp
+    amp_dtype = torch.bfloat16
+
+    end = time.time()
+    for i, batch_data in enumerate(val_loader):
+        if args.model_type == 'mvit_temporal':
+            raise ValueError("Multihead sweep is not supported for temporal flow models.")
+
+        if args.multi_task:
+            images, verb_target, noun_target, action_target = batch_data
+            verb_target = verb_target.cuda(args.gpu, non_blocking=True)
+            noun_target = noun_target.cuda(args.gpu, non_blocking=True)
+            action_target = action_target.cuda(args.gpu, non_blocking=True)
+        else:
+            images, target = batch_data
+            target = target.cuda(args.gpu, non_blocking=True)
+
+        images = images.cuda(args.gpu, non_blocking=True)
+
+        with amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+            tokens = encoder(images)
+            outputs = [c(tokens) for c in classifiers]
+
+        batch_size = images.size(0)
+        if args.multi_task:
+            action_accs = [accuracy(o["action"], action_target, topk=(1, 5)) for o in outputs]
+            verb_accs = [accuracy(o["verb"], verb_target, topk=(1, 5)) for o in outputs]
+            noun_accs = [accuracy(o["noun"], noun_target, topk=(1, 5)) for o in outputs]
+
+            for meter, acc in zip(per_head_top1_action, action_accs):
+                meter.update(acc[0].item(), batch_size)
+            for meter, acc in zip(per_head_top5_action, action_accs):
+                meter.update(acc[1].item(), batch_size)
+            for meter, acc in zip(per_head_top1_verb, verb_accs):
+                meter.update(acc[0].item(), batch_size)
+            for meter, acc in zip(per_head_top5_verb, verb_accs):
+                meter.update(acc[1].item(), batch_size)
+            for meter, acc in zip(per_head_top1_noun, noun_accs):
+                meter.update(acc[0].item(), batch_size)
+            for meter, acc in zip(per_head_top5_noun, noun_accs):
+                meter.update(acc[1].item(), batch_size)
+
+            top1_action.update(max([a[0].item() for a in action_accs]), batch_size)
+            top1_verb.update(max([a[0].item() for a in verb_accs]), batch_size)
+            top1_noun.update(max([a[0].item() for a in noun_accs]), batch_size)
+            top5_action.update(max([a[1].item() for a in action_accs]), batch_size)
+            top5_verb.update(max([a[1].item() for a in verb_accs]), batch_size)
+            top5_noun.update(max([a[1].item() for a in noun_accs]), batch_size)
+        else:
+            accs = [accuracy(o, target, topk=(1, 5)) for o in outputs]
+            for meter, acc in zip(per_head_top1, accs):
+                meter.update(acc[0].item(), batch_size)
+            for meter, acc in zip(per_head_top5, accs):
+                meter.update(acc[1].item(), batch_size)
+            top1.update(max([a[0].item() for a in accs]), batch_size)
+            top5.update(max([a[1].item() for a in accs]), batch_size)
+
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if i % args.print_freq == 0:
+            progress.display(i)
+
+    if args.multi_task:
+        head_scores = [m.avg for m in per_head_top1_action]
+        best_head_idx = int(np.argmax(head_scores)) if head_scores else 0
+        ret = {
+            'acc1_action': max([m.avg for m in per_head_top1_action]),
+            'acc1_verb': max([m.avg for m in per_head_top1_verb]),
+            'acc1_noun': max([m.avg for m in per_head_top1_noun]),
+            'acc5_action': max([m.avg for m in per_head_top5_action]),
+            'acc5_verb': max([m.avg for m in per_head_top5_verb]),
+            'acc5_noun': max([m.avg for m in per_head_top5_noun]),
+            'best_head_idx': best_head_idx,
+        }
+    else:
+        head_scores = [m.avg for m in per_head_top1]
+        best_head_idx = int(np.argmax(head_scores)) if head_scores else 0
+        ret = {
+            'acc1': max([m.avg for m in per_head_top1]),
+            'acc5': max([m.avg for m in per_head_top5]),
+            'best_head_idx': best_head_idx,
+        }
+    return ret
+
+
 def validate(val_loader, model, flow_model, args):
     """Validation function"""
     batch_time = AverageMeter('Time', ':6.2f')
@@ -967,21 +1436,45 @@ def validate(val_loader, model, flow_model, args):
     all_targets = torch.cat(all_targets)
     predictions = all_outputs.argmax(dim=1)
     cm = confusion_matrix(all_targets.numpy(), predictions.numpy())
-    per_class_acc = cm.diagonal() / cm.sum(axis=1)
-    mean_class_acc = np.mean(per_class_acc)
+    class_counts = cm.sum(axis=1)
+    per_class_acc = np.divide(
+        cm.diagonal(),
+        class_counts,
+        out=np.zeros_like(class_counts, dtype=np.float64),
+        where=class_counts > 0,
+    )
+    mean_class_acc = per_class_acc[class_counts > 0].mean() if np.any(class_counts > 0) else 0.0
 
     if args.multi_task:
         all_outputs_verb = torch.cat(all_outputs_verb)
         all_targets_verb = torch.cat(all_targets_verb)
         pred_verb = all_outputs_verb.argmax(dim=1)
         cm_verb = confusion_matrix(all_targets_verb.numpy(), pred_verb.numpy())
-        mean_class_acc_verb = np.mean(cm_verb.diagonal() / cm_verb.sum(axis=1))
+        verb_counts = cm_verb.sum(axis=1)
+        per_class_acc_verb = np.divide(
+            cm_verb.diagonal(),
+            verb_counts,
+            out=np.zeros_like(verb_counts, dtype=np.float64),
+            where=verb_counts > 0,
+        )
+        mean_class_acc_verb = (
+            per_class_acc_verb[verb_counts > 0].mean() if np.any(verb_counts > 0) else 0.0
+        )
 
         all_outputs_noun = torch.cat(all_outputs_noun)
         all_targets_noun = torch.cat(all_targets_noun)
         pred_noun = all_outputs_noun.argmax(dim=1)
         cm_noun = confusion_matrix(all_targets_noun.numpy(), pred_noun.numpy())
-        mean_class_acc_noun = np.mean(cm_noun.diagonal() / cm_noun.sum(axis=1))
+        noun_counts = cm_noun.sum(axis=1)
+        per_class_acc_noun = np.divide(
+            cm_noun.diagonal(),
+            noun_counts,
+            out=np.zeros_like(noun_counts, dtype=np.float64),
+            where=noun_counts > 0,
+        )
+        mean_class_acc_noun = (
+            per_class_acc_noun[noun_counts > 0].mean() if np.any(noun_counts > 0) else 0.0
+        )
 
         print(
             " * Acc@1 (A/V/N) "
@@ -1055,6 +1548,18 @@ def main(args):
                 args.num_classes = 97
             elif args.task_type == 'noun':
                 args.num_classes = 300
+
+    if args.multihead_sweep:
+        if args.model_type not in VJEPA2_MODEL_SPECS:
+            raise ValueError("Multihead sweep is only supported for V-JEPA2 models.")
+        if args.vjepa2_head != 'attentive':
+            raise ValueError("Multihead sweep requires the attentive V-JEPA2 head.")
+        if args.unfreeze_encoder:
+            raise ValueError("Multihead sweep requires a frozen V-JEPA2 encoder.")
+        if args.use_sgd and dist_utils.is_main_process():
+            print("=> Multihead sweep ignores --use-sgd and uses AdamW.")
+        if args.update_freq != 1 and dist_utils.is_main_process():
+            print("=> Multihead sweep ignores --update-freq (uses 1).")
     
     # Set task-specific arguments for compatibility with LaViLa datasets
     # The egtea_finetune_type is used by the dataset to determine which labels to return
@@ -1073,114 +1578,116 @@ def main(args):
     else:
         print(f"=> Number of classes: {args.num_classes}")
     
-    # Create model
-    if args.model_type == 'mvit_spatial':
-        model = MViT_Spatial(args.num_classes, dropout=args.dropout_ratio)
-    elif args.model_type == 'mvit_temporal':
-        model = MViT_Temporal(args.num_classes, dropout=args.dropout_ratio)
-    elif args.model_type in VJEPA2_MODEL_SPECS:
-        if args.multi_task:
-            model = VJEPA2MultiTaskProbeClassifier(
-                args.model_type,
-                num_verb_classes=args.num_classes_verb,
-                num_noun_classes=args.num_classes_noun,
-                num_action_classes=args.num_classes_action,
-                probe_num_heads=args.probe_num_heads,
-                probe_num_blocks=args.probe_num_blocks,
-                probe_mlp_ratio=args.probe_mlp_ratio,
-                probe_dropout=args.probe_dropout,
-                use_activation_checkpointing=args.probe_use_activation_checkpointing,
-                freeze_encoder=not args.unfreeze_encoder,
-            )
-        elif args.vjepa2_head == 'meanpool':
-            model = VJEPA2MeanPoolClassifier(args.model_type, args.num_classes, dropout=args.dropout_ratio)
-        else:
-            model = VJEPA2ProbeClassifier(
-                args.model_type,
-                args.num_classes,
-                probe_num_heads=args.probe_num_heads,
-                probe_num_blocks=args.probe_num_blocks,
-                probe_mlp_ratio=args.probe_mlp_ratio,
-                probe_dropout=args.probe_dropout,
-                use_activation_checkpointing=args.probe_use_activation_checkpointing,
-                freeze_encoder=not args.unfreeze_encoder,
-            )
-    else:
-        raise ValueError(f'Unknown model type: {args.model_type}')
-    
-    # Load pretrained weights if provided
-    if args.pretrain_model:
-        print(f"=> Loading pretrained model: {args.pretrain_model}")
-        checkpoint = load_checkpoint(args.pretrain_model)
-        state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
-        
-        # Clean up state dict keys
-        new_state_dict = OrderedDict()
-        for k, v in state_dict.items():
-            k = k.replace('module.', '')
-            new_state_dict[k] = v
-        
-        missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, strict=False)
-        if missing_keys:
-            print(f"Missing keys: {missing_keys}")
-        if unexpected_keys:
-            print(f"Unexpected keys: {unexpected_keys}")
-    
-    model.cuda(args.gpu)
-    
-    # Initialize RAFT model for temporal mode
+    model = None
     flow_model = None
-    if args.model_type == 'mvit_temporal':
-        flow_model = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False).cuda(args.gpu)
-        flow_model.eval()
-        print("=> Initialized RAFT model for optical flow computation")
-    
-    # Setup distributed model
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[args.gpu], bucket_cap_mb=200,
-            find_unused_parameters=args.find_unused_parameters
-        )
-    
-    # Create optimizer
-    parameters = [p for p in model.parameters() if p.requires_grad]
-    if not parameters:
-        raise RuntimeError("No trainable parameters found. Check encoder freeze settings.")
-    if args.use_sgd:
-        optimizer = torch.optim.SGD(parameters, lr=args.lr, momentum=args.betas[0], weight_decay=args.wd)
-    else:
-        optimizer = torch.optim.AdamW(parameters, lr=args.lr, betas=args.betas, eps=args.eps, weight_decay=args.wd)
-    
-    # Create gradient scaler for mixed precision
-    scaler = amp.GradScaler(enabled=not args.disable_amp)
-    
-    # Resume from checkpoint
-    best_acc1 = 0.
-    if args.resume:
-        if os.path.isfile(args.resume):
-            print(f"=> Resuming from checkpoint: {args.resume}")
-            checkpoint = load_checkpoint(args.resume)
-            args.start_epoch = checkpoint['epoch']
-            state_dict = checkpoint['state_dict']
-            
-            # Handle DDP state dict
-            if not args.distributed:
-                new_state_dict = OrderedDict()
-                for k, v in state_dict.items():
-                    k = k.replace('module.', '')
-                    new_state_dict[k] = v
-                model.load_state_dict(new_state_dict)
+    if not args.multihead_sweep:
+        # Create model
+        if args.model_type == 'mvit_spatial':
+            model = MViT_Spatial(args.num_classes, dropout=args.dropout_ratio)
+        elif args.model_type == 'mvit_temporal':
+            model = MViT_Temporal(args.num_classes, dropout=args.dropout_ratio)
+        elif args.model_type in VJEPA2_MODEL_SPECS:
+            if args.multi_task:
+                model = VJEPA2MultiTaskProbeClassifier(
+                    args.model_type,
+                    num_verb_classes=args.num_classes_verb,
+                    num_noun_classes=args.num_classes_noun,
+                    num_action_classes=args.num_classes_action,
+                    probe_num_heads=args.probe_num_heads,
+                    probe_num_blocks=args.probe_num_blocks,
+                    probe_mlp_ratio=args.probe_mlp_ratio,
+                    probe_dropout=args.probe_dropout,
+                    use_activation_checkpointing=args.probe_use_activation_checkpointing,
+                    freeze_encoder=not args.unfreeze_encoder,
+                )
+            elif args.vjepa2_head == 'meanpool':
+                model = VJEPA2MeanPoolClassifier(args.model_type, args.num_classes, dropout=args.dropout_ratio)
             else:
-                model.load_state_dict(state_dict)
-            
-            if 'optimizer' in checkpoint:
-                optimizer.load_state_dict(checkpoint['optimizer'])
-            if 'scaler' in checkpoint:
-                scaler.load_state_dict(checkpoint['scaler'])
-            best_acc1 = checkpoint.get('best_acc1', 0.)
-            print(f"=> Loaded checkpoint (epoch {checkpoint['epoch']})")
+                model = VJEPA2ProbeClassifier(
+                    args.model_type,
+                    args.num_classes,
+                    probe_num_heads=args.probe_num_heads,
+                    probe_num_blocks=args.probe_num_blocks,
+                    probe_mlp_ratio=args.probe_mlp_ratio,
+                    probe_dropout=args.probe_dropout,
+                    use_activation_checkpointing=args.probe_use_activation_checkpointing,
+                    freeze_encoder=not args.unfreeze_encoder,
+                )
         else:
-            print(f"=> No checkpoint found at '{args.resume}'")
+            raise ValueError(f'Unknown model type: {args.model_type}')
+
+        # Load pretrained weights if provided
+        if args.pretrain_model:
+            print(f"=> Loading pretrained model: {args.pretrain_model}")
+            checkpoint = load_checkpoint(args.pretrain_model)
+            state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
+
+            # Clean up state dict keys
+            new_state_dict = OrderedDict()
+            for k, v in state_dict.items():
+                k = k.replace('module.', '')
+                new_state_dict[k] = v
+
+            missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, strict=False)
+            if missing_keys:
+                print(f"Missing keys: {missing_keys}")
+            if unexpected_keys:
+                print(f"Unexpected keys: {unexpected_keys}")
+
+        model.cuda(args.gpu)
+
+        # Initialize RAFT model for temporal mode
+        if args.model_type == 'mvit_temporal':
+            flow_model = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False).cuda(args.gpu)
+            flow_model.eval()
+            print("=> Initialized RAFT model for optical flow computation")
+
+        # Setup distributed model
+        if args.distributed:
+            model = torch.nn.parallel.DistributedDataParallel(
+                model, device_ids=[args.gpu], bucket_cap_mb=200,
+                find_unused_parameters=args.find_unused_parameters
+            )
+
+        # Create optimizer
+        parameters = [p for p in model.parameters() if p.requires_grad]
+        if not parameters:
+            raise RuntimeError("No trainable parameters found. Check encoder freeze settings.")
+        if args.use_sgd:
+            optimizer = torch.optim.SGD(parameters, lr=args.lr, momentum=args.betas[0], weight_decay=args.wd)
+        else:
+            optimizer = torch.optim.AdamW(parameters, lr=args.lr, betas=args.betas, eps=args.eps, weight_decay=args.wd)
+
+        # Create gradient scaler for mixed precision
+        scaler = amp.GradScaler(enabled=not args.disable_amp)
+
+        # Resume from checkpoint
+        best_acc1 = 0.
+        if args.resume:
+            if os.path.isfile(args.resume):
+                print(f"=> Resuming from checkpoint: {args.resume}")
+                checkpoint = load_checkpoint(args.resume)
+                args.start_epoch = checkpoint['epoch']
+                state_dict = checkpoint['state_dict']
+
+                # Handle DDP state dict
+                if not args.distributed:
+                    new_state_dict = OrderedDict()
+                    for k, v in state_dict.items():
+                        k = k.replace('module.', '')
+                        new_state_dict[k] = v
+                    model.load_state_dict(new_state_dict)
+                else:
+                    model.load_state_dict(state_dict)
+
+                if 'optimizer' in checkpoint:
+                    optimizer.load_state_dict(checkpoint['optimizer'])
+                if 'scaler' in checkpoint:
+                    scaler.load_state_dict(checkpoint['scaler'])
+                best_acc1 = checkpoint.get('best_acc1', 0.)
+                print(f"=> Loaded checkpoint (epoch {checkpoint['epoch']})")
+            else:
+                print(f"=> No checkpoint found at '{args.resume}'")
     
     # Data loading
     cudnn.benchmark = True
@@ -1360,17 +1867,236 @@ def main(args):
             else:
                 criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).cuda(args.gpu)
     
-    # Learning rate schedule
-    lr_schedule = cosine_scheduler(
-        args.lr, args.lr_end, args.epochs, len(train_loader) // args.update_freq,
-        warmup_epochs=args.warmup_epochs, start_warmup_value=args.lr_start,
-    )
+    # Learning rate schedule (single-head training)
+    lr_schedule = None
+    if not args.multihead_sweep:
+        lr_schedule = cosine_scheduler(
+            args.lr, args.lr_end, args.epochs, len(train_loader) // args.update_freq,
+            warmup_epochs=args.warmup_epochs, start_warmup_value=args.lr_start,
+        )
     
     # Initialize wandb
     if dist_utils.is_main_process() and args.wandb:
         wandb_id = os.path.split(args.output_dir)[-1]
         wandb.init(project='MViT-LaViLa', id=wandb_id, config=args, resume='allow')
-    
+
+    if args.multihead_sweep:
+        amp_enabled = args.use_bfloat16 and not args.disable_amp
+
+        encoder = _load_vjepa2_encoder(args.model_type)
+        if args.pretrain_model:
+            print(f"=> Loading pretrained encoder: {args.pretrain_model}")
+            checkpoint = load_checkpoint(args.pretrain_model)
+            state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
+            enc_keys = set(encoder.state_dict().keys())
+            cleaned_state = OrderedDict()
+            for k, v in state_dict.items():
+                k = k.replace('module.', '')
+                if k.startswith('encoder.'):
+                    k = k[len('encoder.'):]
+                if k in enc_keys:
+                    cleaned_state[k] = v
+            if cleaned_state:
+                missing_keys, unexpected_keys = encoder.load_state_dict(cleaned_state, strict=False)
+                if missing_keys:
+                    print(f"Missing encoder keys: {missing_keys}")
+                if unexpected_keys:
+                    print(f"Unexpected encoder keys: {unexpected_keys}")
+            else:
+                print("Warning: no encoder weights matched the provided checkpoint.")
+        encoder.cuda(args.gpu)
+        encoder.eval()
+        for p in encoder.parameters():
+            p.requires_grad = False
+
+        opt_kwargs = load_multihead_kwargs(args.multihead_config)
+        if args.multihead_max_heads > 0:
+            opt_kwargs = opt_kwargs[:args.multihead_max_heads]
+        if not opt_kwargs:
+            raise ValueError("No multihead optimizer configurations found.")
+
+        if args.multi_task:
+            classifiers = [
+                VJEPA2MultiTaskProbeHead(
+                    embed_dim=encoder.embed_dim,
+                    num_verb_classes=args.num_classes_verb,
+                    num_noun_classes=args.num_classes_noun,
+                    num_action_classes=args.num_classes_action,
+                    num_heads=args.probe_num_heads,
+                    depth=args.probe_num_blocks,
+                    mlp_ratio=args.probe_mlp_ratio,
+                    dropout=args.probe_dropout,
+                    use_activation_checkpointing=args.probe_use_activation_checkpointing,
+                ).cuda(args.gpu)
+                for _ in opt_kwargs
+            ]
+        else:
+            classifiers = [
+                VJEPA2ProbeHead(
+                    embed_dim=encoder.embed_dim,
+                    num_classes=args.num_classes,
+                    num_heads=args.probe_num_heads,
+                    depth=args.probe_num_blocks,
+                    mlp_ratio=args.probe_mlp_ratio,
+                    dropout=args.probe_dropout,
+                    use_activation_checkpointing=args.probe_use_activation_checkpointing,
+                ).cuda(args.gpu)
+                for _ in opt_kwargs
+            ]
+
+        if dist_utils.is_main_process():
+            print(f"=> Multihead sweep: {len(classifiers)} probe heads")
+
+        if args.distributed:
+            classifiers = [
+                torch.nn.parallel.DistributedDataParallel(
+                    c, device_ids=[args.gpu], static_graph=True
+                )
+                for c in classifiers
+            ]
+
+        optimizers, scalers, schedulers, wd_schedulers = init_multihead_opt(
+            classifiers=classifiers,
+            iterations_per_epoch=len(train_loader),
+            opt_kwargs=opt_kwargs,
+            num_epochs=args.epochs,
+            use_scaler=amp_enabled,
+        )
+
+        best_acc1 = 0.0
+        best_head_idx = 0
+        start_epoch = args.start_epoch
+        if args.resume:
+            if os.path.isfile(args.resume):
+                start_epoch, best_acc1, best_head_idx = load_multihead_checkpoint(
+                    args.resume, encoder, classifiers, optimizers, scalers
+                )
+                args.start_epoch = start_epoch
+                for _ in range(start_epoch * len(train_loader)):
+                    [s.step() for s in schedulers]
+                    [wds.step() for wds in wd_schedulers]
+                print(f"=> Loaded multihead checkpoint (epoch {start_epoch})")
+            else:
+                print(f"=> No checkpoint found at '{args.resume}'")
+
+        print("=> Starting multihead sweep")
+        print(args)
+
+        for epoch in range(start_epoch, args.epochs):
+            if args.distributed:
+                train_sampler.set_epoch(epoch)
+
+            train_stats = train_multihead_epoch(
+                train_loader,
+                encoder,
+                classifiers,
+                criterion,
+                optimizers,
+                scalers,
+                schedulers,
+                wd_schedulers,
+                epoch,
+                args,
+            )
+
+            if (epoch + 1) % args.eval_freq == 0:
+                val_stats = validate_multihead(val_loader, encoder, classifiers, args)
+                val_acc1 = val_stats["acc1_action"] if args.multi_task else val_stats["acc1"]
+                is_best = val_acc1 > best_acc1
+                if is_best:
+                    best_acc1 = val_acc1
+                    best_head_idx = val_stats.get("best_head_idx", 0)
+
+                if dist_utils.is_main_process():
+                    classifier_states = [_unwrap_ddp(c).state_dict() for c in classifiers]
+                    scaler_states = None
+                    if amp_enabled and scalers and all(s is not None for s in scalers):
+                        scaler_states = [s.state_dict() for s in scalers]
+                    best_classifier = _unwrap_ddp(classifiers[best_head_idx])
+                    best_state = build_probe_state_dict(encoder, best_classifier)
+
+                    save_checkpoint({
+                        'epoch': epoch + 1,
+                        'classifiers': classifier_states,
+                        'optimizers': [o.state_dict() for o in optimizers],
+                        'scalers': scaler_states,
+                        'encoder_state_dict': encoder.state_dict(),
+                        'state_dict': best_state,
+                        'best_acc1': best_acc1,
+                        'best_head_idx': best_head_idx,
+                        'args': args,
+                    }, is_best, args.output_dir)
+
+                    if args.wandb:
+                        wandb_payload = {
+                            'epoch': epoch,
+                            'train_loss': train_stats['loss'],
+                            'best_acc1': best_acc1,
+                            'best_head_idx': best_head_idx,
+                            'lr': train_stats['lr'],
+                        }
+                        if args.multi_task:
+                            wandb_payload.update({
+                                'train_acc1_action': train_stats['acc1_action'],
+                                'train_acc1_verb': train_stats['acc1_verb'],
+                                'train_acc1_noun': train_stats['acc1_noun'],
+                                'train_acc5_action': train_stats['acc5_action'],
+                                'train_acc5_verb': train_stats['acc5_verb'],
+                                'train_acc5_noun': train_stats['acc5_noun'],
+                                'val_acc1_action': val_stats['acc1_action'],
+                                'val_acc1_verb': val_stats['acc1_verb'],
+                                'val_acc1_noun': val_stats['acc1_noun'],
+                                'val_acc5_action': val_stats['acc5_action'],
+                                'val_acc5_verb': val_stats['acc5_verb'],
+                                'val_acc5_noun': val_stats['acc5_noun'],
+                            })
+                        else:
+                            wandb_payload.update({
+                                'train_acc1': train_stats['acc1'],
+                                'train_acc5': train_stats['acc5'],
+                                'val_acc1': val_stats['acc1'],
+                                'val_acc5': val_stats['acc5'],
+                            })
+                        wandb.log(wandb_payload)
+
+                    log_stats = {
+                        'epoch': epoch,
+                        **{f'train_{k}': v for k, v in train_stats.items()},
+                        'best_acc1': best_acc1,
+                        'best_head_idx': best_head_idx,
+                        **{f'val_{k}': v for k, v in val_stats.items()},
+                    }
+                    with open(os.path.join(args.output_dir, 'log.txt'), 'a') as f:
+                        f.write(json.dumps(log_stats) + '\n')
+
+            elif (epoch + 1) % args.save_freq == 0:
+                if dist_utils.is_main_process():
+                    classifier_states = [_unwrap_ddp(c).state_dict() for c in classifiers]
+                    scaler_states = None
+                    if amp_enabled and scalers and all(s is not None for s in scalers):
+                        scaler_states = [s.state_dict() for s in scalers]
+                    best_classifier = _unwrap_ddp(classifiers[best_head_idx])
+                    best_state = build_probe_state_dict(encoder, best_classifier)
+
+                    save_checkpoint({
+                        'epoch': epoch + 1,
+                        'classifiers': classifier_states,
+                        'optimizers': [o.state_dict() for o in optimizers],
+                        'scalers': scaler_states,
+                        'encoder_state_dict': encoder.state_dict(),
+                        'state_dict': best_state,
+                        'best_acc1': best_acc1,
+                        'best_head_idx': best_head_idx,
+                        'args': args,
+                    }, False, args.output_dir)
+
+        print("=> Training completed")
+        if args.multi_task:
+            print(f"Best Acc@1 (action): {best_acc1:.3f}")
+        else:
+            print(f"Best Acc@1: {best_acc1:.3f}")
+        return
+
     print("=> Starting training")
     print(args)
     
