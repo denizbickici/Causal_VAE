@@ -8,6 +8,8 @@
 Feature extraction script for MViT and V-JEPA backbones.
 Outputs follow the same format as the original extractor:
   {'feats': ..., 'cls_feats': ..., 'outputs': ..., 'targets': ...}
+Multi-task V-JEPA2 extraction adds:
+  {'temporal_probe_feats': ...}
 """
 
 import argparse
@@ -402,11 +404,17 @@ def compute_flow_sequence(images, images_flow, flow_model, args):
 
 def forward_with_features(model, model_type, activation, inputs, args):
 	"""Run model forward pass and return logits, token features and cls features."""
+	temporal_probe_feat = None
 	if model_type in VJEPA2_MODEL_SPECS:
 		if args.multi_task:
 			logits, tokens, probe_feats = model(inputs, return_features=True)
 			feat = reshape_temporal_features(tokens, args.clip_length)
 			cls_feat = probe_feats
+			model_without_ddp = model.module if hasattr(model, 'module') else model
+			pooler = getattr(getattr(model_without_ddp, 'probe', None), 'pooler', None)
+			if pooler is not None and hasattr(pooler, 'forward_sequence'):
+				seq_tokens = pooler.forward_sequence(tokens)
+				temporal_probe_feat = reshape_temporal_features(seq_tokens, args.clip_length)
 		else:
 			logits, tokens, pooled = model(inputs, return_features=True)
 			feat = reshape_temporal_features(tokens, args.clip_length)
@@ -417,7 +425,7 @@ def forward_with_features(model, model_type, activation, inputs, args):
 		cls_feat = token_output[:, 0, :]
 		patch_tokens = token_output[:, 1:, :]
 		feat = reshape_temporal_features(patch_tokens, args.clip_length)
-	return logits, feat, cls_feat
+	return logits, feat, cls_feat, temporal_probe_feat
 
 
 def extract_split(loader, model, flow_model, args, subset: str, head: str = None):
@@ -450,6 +458,7 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 		hook_handle = model_without_ddp.mvit.blocks[-1].mlp.register_forward_hook(hook)
 
 	all_outputs, all_targets, all_feats, all_cls_feats = [], [], [], []
+	all_temporal_probe_feats = [] if args.multi_task else None
 	end = time.time()
 
 	with torch.no_grad():
@@ -467,7 +476,7 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 						flow_input = compute_flow_sequence(crop, crop_flow, flow_model, args)
 						if args.use_half:
 							flow_input = flow_input.half()
-						logits, feat, cls_feat = forward_with_features(
+						logits, feat, cls_feat, _ = forward_with_features(
 							model, args.model_type, activation, flow_input, args
 						)
 						logits_crops.append(logits.unsqueeze(1).detach().cpu())
@@ -482,7 +491,7 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 					flow_input = compute_flow_sequence(images, images_flow, flow_model, args)
 					if args.use_half:
 						flow_input = flow_input.half()
-					logits, feat, cls_feat = forward_with_features(
+					logits, feat, cls_feat, _ = forward_with_features(
 						model, args.model_type, activation, flow_input, args
 					)
 					all_outputs.append(logits.detach().cpu())
@@ -503,32 +512,41 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 				target_gpu = target.cuda(args.gpu, non_blocking=True)
 				if isinstance(images, list):
 					logits_crops, feats_crops, cls_crops = [], [], []
+					temporal_probe_crops = [] if args.multi_task else None
 					for crop in images:
 						crop = crop.cuda(args.gpu, non_blocking=True)
 						if args.use_half:
 							crop = crop.half()
-						logits, feat, cls_feat = forward_with_features(
+						logits, feat, cls_feat, temporal_probe_feat = forward_with_features(
 							model, args.model_type, activation, crop, args
 						)
 						if args.multi_task:
 							logits = logits[head]
 							cls_feat = cls_feat[head]
+							if temporal_probe_feat is None:
+								raise RuntimeError("Temporal probe features unavailable; check AttentivePooler.forward_sequence.")
+							temporal_probe_crops.append(temporal_probe_feat.unsqueeze(1).detach().cpu())
 						logits_crops.append(logits.unsqueeze(1).detach().cpu())
 						feats_crops.append(feat.unsqueeze(1).detach().cpu())
 						cls_crops.append(cls_feat.unsqueeze(1).detach().cpu())
 					all_outputs.append(torch.cat(logits_crops, dim=1))
 					all_feats.append(torch.cat(feats_crops, dim=1))
 					all_cls_feats.append(torch.cat(cls_crops, dim=1))
+					if args.multi_task:
+						all_temporal_probe_feats.append(torch.cat(temporal_probe_crops, dim=1))
 				else:
 					images = images.cuda(args.gpu, non_blocking=True)
 					if args.use_half:
 						images = images.half()
-					logits, feat, cls_feat = forward_with_features(
+					logits, feat, cls_feat, temporal_probe_feat = forward_with_features(
 						model, args.model_type, activation, images, args
 					)
 					if args.multi_task:
 						logits = logits[head]
 						cls_feat = cls_feat[head]
+						if temporal_probe_feat is None:
+							raise RuntimeError("Temporal probe features unavailable; check AttentivePooler.forward_sequence.")
+						all_temporal_probe_feats.append(temporal_probe_feat.detach().cpu())
 					all_outputs.append(logits.detach().cpu())
 					all_feats.append(feat.detach().cpu())
 					all_cls_feats.append(cls_feat.detach().cpu())
@@ -547,18 +565,23 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 	all_cls_feats = torch.cat(all_cls_feats)
 	all_outputs = torch.cat(all_outputs)
 	all_targets = torch.cat(all_targets)
+	if args.multi_task:
+		all_temporal_probe_feats = torch.cat(all_temporal_probe_feats)
 
 	if args.multi_task:
 		save_name = f"{args.dataset}_{subset}_{head}_feat.pt"
 	else:
 		save_name = f"{args.dataset}_{subset}_feat.pt"
 	save_path = os.path.join(args.output_dir, save_name)
-	torch.save({
+	save_payload = {
 		'feats': all_feats,
 		'cls_feats': all_cls_feats,
 		'outputs': all_outputs,
 		'targets': all_targets,
-	}, save_path)
+	}
+	if args.multi_task:
+		save_payload['temporal_probe_feats'] = all_temporal_probe_feats
+	torch.save(save_payload, save_path)
 
 	if args.multi_task:
 		print(f"Saved {subset} {head} features to {save_path}")
@@ -566,6 +589,8 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 		print(f"Saved {subset} features to {save_path}")
 	print(f"  feats: {all_feats.shape}")
 	print(f"  cls_feats: {all_cls_feats.shape}")
+	if args.multi_task:
+		print(f"  temporal_probe_feats: {all_temporal_probe_feats.shape}")
 	print(f"  outputs: {all_outputs.shape}")
 	print(f"  targets: {all_targets.shape}")
 
