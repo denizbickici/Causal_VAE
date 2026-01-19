@@ -10,6 +10,8 @@ Outputs follow the same format as the original extractor:
   {'feats': ..., 'cls_feats': ..., 'outputs': ..., 'targets': ...}
 Multi-task V-JEPA2 extraction adds:
   {'temporal_probe_feats': ...}
+Backbone motion extraction adds:
+  {'verb_input_feats': ...}
 """
 
 import argparse
@@ -53,6 +55,19 @@ VJEPA2_MODEL_SPECS = {
 	'vjepa2_giant': {'hub_name': 'vjepa2_vit_giant', 'crop_size': 256},
 	'vjepa2_giant_384': {'hub_name': 'vjepa2_vit_giant_384', 'crop_size': 384},
 }
+VJEPA2_MOTION_LAYERS_1BASED = [25, 27, 29, 31]
+
+
+def _get_motion_layer_indices(encoder):
+	motion_layers = [idx - 1 for idx in VJEPA2_MOTION_LAYERS_1BASED]
+	if hasattr(encoder, "get_num_layers"):
+		num_layers = encoder.get_num_layers()
+		if max(motion_layers) >= num_layers:
+			raise ValueError(
+				f"Motion layers {motion_layers} exceed encoder depth {num_layers}; "
+				"adjust VJEPA2_MOTION_LAYERS_1BASED for this backbone."
+			)
+	return motion_layers
 
 
 def _get_vjepa2_attentive_pooler():
@@ -258,6 +273,23 @@ def reshape_temporal_features(token_feats: torch.Tensor, clip_length: int):
 	return token_feats
 
 
+def extract_motion_features(encoder: nn.Module, inputs: torch.Tensor, clip_length: int):
+	"""Extract concatenated motion-layer tokens and pool spatially to [B, T, D]."""
+	if not hasattr(encoder, "out_layers"):
+		raise RuntimeError("Encoder does not expose out_layers for intermediate extraction.")
+	motion_layers = _get_motion_layer_indices(encoder)
+	prev_out_layers = encoder.out_layers
+	encoder.out_layers = motion_layers
+	try:
+		outs = encoder(inputs)
+	finally:
+		encoder.out_layers = prev_out_layers
+	if not isinstance(outs, (list, tuple)) or len(outs) != len(motion_layers):
+		raise RuntimeError("Unexpected intermediate layer outputs from encoder.")
+	motion_tokens = torch.cat(outs, dim=-1)
+	return reshape_temporal_features(motion_tokens, clip_length)
+
+
 def build_ek100_multitask_label_maps(train_csv: str):
 	verb_set = set()
 	noun_set = set()
@@ -403,14 +435,15 @@ def compute_flow_sequence(images, images_flow, flow_model, args):
 
 
 def forward_with_features(model, model_type, activation, inputs, args):
-	"""Run model forward pass and return logits, token features and cls features."""
+	"""Run model forward pass and return logits, token features and auxiliary features."""
 	temporal_probe_feat = None
+	verb_input_feat = None
 	if model_type in VJEPA2_MODEL_SPECS:
+		model_without_ddp = model.module if hasattr(model, 'module') else model
 		if args.multi_task:
 			logits, tokens, probe_feats = model(inputs, return_features=True)
 			feat = reshape_temporal_features(tokens, args.clip_length)
 			cls_feat = probe_feats
-			model_without_ddp = model.module if hasattr(model, 'module') else model
 			pooler = getattr(getattr(model_without_ddp, 'probe', None), 'pooler', None)
 			if pooler is not None and hasattr(pooler, 'forward_sequence'):
 				seq_tokens = pooler.forward_sequence(tokens)
@@ -419,13 +452,17 @@ def forward_with_features(model, model_type, activation, inputs, args):
 			logits, tokens, pooled = model(inputs, return_features=True)
 			feat = reshape_temporal_features(tokens, args.clip_length)
 			cls_feat = pooled
+		encoder = getattr(model_without_ddp, 'encoder', None)
+		if encoder is None:
+			raise RuntimeError("V-JEPA2 model is missing encoder; cannot extract motion layers.")
+		verb_input_feat = extract_motion_features(encoder, inputs, args.clip_length)
 	else:
 		logits = model(inputs)
 		token_output = activation['tokens']
 		cls_feat = token_output[:, 0, :]
 		patch_tokens = token_output[:, 1:, :]
 		feat = reshape_temporal_features(patch_tokens, args.clip_length)
-	return logits, feat, cls_feat, temporal_probe_feat
+	return logits, feat, cls_feat, temporal_probe_feat, verb_input_feat
 
 
 def extract_split(loader, model, flow_model, args, subset: str, head: str = None):
@@ -459,6 +496,7 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 
 	all_outputs, all_targets, all_feats, all_cls_feats = [], [], [], []
 	all_temporal_probe_feats = [] if args.multi_task else None
+	all_verb_input_feats = [] if args.model_type in VJEPA2_MODEL_SPECS else None
 	end = time.time()
 
 	with torch.no_grad():
@@ -476,7 +514,7 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 						flow_input = compute_flow_sequence(crop, crop_flow, flow_model, args)
 						if args.use_half:
 							flow_input = flow_input.half()
-						logits, feat, cls_feat, _ = forward_with_features(
+						logits, feat, cls_feat, _, _ = forward_with_features(
 							model, args.model_type, activation, flow_input, args
 						)
 						logits_crops.append(logits.unsqueeze(1).detach().cpu())
@@ -491,7 +529,7 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 					flow_input = compute_flow_sequence(images, images_flow, flow_model, args)
 					if args.use_half:
 						flow_input = flow_input.half()
-					logits, feat, cls_feat, _ = forward_with_features(
+					logits, feat, cls_feat, _, _ = forward_with_features(
 						model, args.model_type, activation, flow_input, args
 					)
 					all_outputs.append(logits.detach().cpu())
@@ -513,11 +551,12 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 				if isinstance(images, list):
 					logits_crops, feats_crops, cls_crops = [], [], []
 					temporal_probe_crops = [] if args.multi_task else None
+					verb_input_crops = [] if args.model_type in VJEPA2_MODEL_SPECS else None
 					for crop in images:
 						crop = crop.cuda(args.gpu, non_blocking=True)
 						if args.use_half:
 							crop = crop.half()
-						logits, feat, cls_feat, temporal_probe_feat = forward_with_features(
+						logits, feat, cls_feat, temporal_probe_feat, verb_input_feat = forward_with_features(
 							model, args.model_type, activation, crop, args
 						)
 						if args.multi_task:
@@ -526,6 +565,8 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 							if temporal_probe_feat is None:
 								raise RuntimeError("Temporal probe features unavailable; check AttentivePooler.forward_sequence.")
 							temporal_probe_crops.append(temporal_probe_feat.unsqueeze(1).detach().cpu())
+						if verb_input_feat is not None:
+							verb_input_crops.append(verb_input_feat.unsqueeze(1).detach().cpu())
 						logits_crops.append(logits.unsqueeze(1).detach().cpu())
 						feats_crops.append(feat.unsqueeze(1).detach().cpu())
 						cls_crops.append(cls_feat.unsqueeze(1).detach().cpu())
@@ -534,11 +575,13 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 					all_cls_feats.append(torch.cat(cls_crops, dim=1))
 					if args.multi_task:
 						all_temporal_probe_feats.append(torch.cat(temporal_probe_crops, dim=1))
+					if verb_input_crops is not None:
+						all_verb_input_feats.append(torch.cat(verb_input_crops, dim=1))
 				else:
 					images = images.cuda(args.gpu, non_blocking=True)
 					if args.use_half:
 						images = images.half()
-					logits, feat, cls_feat, temporal_probe_feat = forward_with_features(
+					logits, feat, cls_feat, temporal_probe_feat, verb_input_feat = forward_with_features(
 						model, args.model_type, activation, images, args
 					)
 					if args.multi_task:
@@ -547,6 +590,8 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 						if temporal_probe_feat is None:
 							raise RuntimeError("Temporal probe features unavailable; check AttentivePooler.forward_sequence.")
 						all_temporal_probe_feats.append(temporal_probe_feat.detach().cpu())
+					if verb_input_feat is not None:
+						all_verb_input_feats.append(verb_input_feat.detach().cpu())
 					all_outputs.append(logits.detach().cpu())
 					all_feats.append(feat.detach().cpu())
 					all_cls_feats.append(cls_feat.detach().cpu())
@@ -567,6 +612,8 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 	all_targets = torch.cat(all_targets)
 	if args.multi_task:
 		all_temporal_probe_feats = torch.cat(all_temporal_probe_feats)
+	if all_verb_input_feats is not None:
+		all_verb_input_feats = torch.cat(all_verb_input_feats)
 
 	if args.multi_task:
 		save_name = f"{args.dataset}_{subset}_{head}_feat.pt"
@@ -581,6 +628,8 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 	}
 	if args.multi_task:
 		save_payload['temporal_probe_feats'] = all_temporal_probe_feats
+	if all_verb_input_feats is not None:
+		save_payload['verb_input_feats'] = all_verb_input_feats
 	torch.save(save_payload, save_path)
 
 	if args.multi_task:
@@ -591,6 +640,8 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 	print(f"  cls_feats: {all_cls_feats.shape}")
 	if args.multi_task:
 		print(f"  temporal_probe_feats: {all_temporal_probe_feats.shape}")
+	if all_verb_input_feats is not None:
+		print(f"  verb_input_feats: {all_verb_input_feats.shape}")
 	print(f"  outputs: {all_outputs.shape}")
 	print(f"  targets: {all_targets.shape}")
 
