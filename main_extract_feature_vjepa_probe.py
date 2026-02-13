@@ -9,7 +9,7 @@ Feature extraction script for MViT and V-JEPA backbones.
 Outputs follow the same format as the original extractor:
   {'feats': ..., 'cls_feats': ..., 'outputs': ..., 'targets': ...}
 Multi-task V-JEPA2 extraction adds:
-  {'temporal_probe_feats': ...}
+  {'temporal_probe_feats': ...}  # head-specific temporal probe features per saved head file
 Backbone motion extraction adds:
   {'verb_input_feats': ...}
 """
@@ -273,6 +273,53 @@ def reshape_temporal_features(token_feats: torch.Tensor, clip_length: int):
 	return token_feats
 
 
+def _reshape_tokens_to_temporal_grid(token_feats: torch.Tensor, clip_length: int):
+	"""Reshape token features to [B, T, S, D] for temporal, head-conditioned pooling."""
+	if clip_length <= 0:
+		raise ValueError(f"clip_length must be > 0, got {clip_length}")
+	token_count = token_feats.shape[1]
+	if token_count % clip_length == 0:
+		tokens_per_frame = token_count // clip_length
+		return token_feats.view(token_feats.shape[0], clip_length, tokens_per_frame, token_feats.shape[-1])
+	if token_count > 1 and (token_count - 1) % clip_length == 0:
+		# Handle layouts with a leading global token.
+		patch_tokens = token_feats[:, 1:, :]
+		tokens_per_frame = patch_tokens.shape[1] // clip_length
+		return patch_tokens.view(token_feats.shape[0], clip_length, tokens_per_frame, token_feats.shape[-1])
+	raise RuntimeError(
+		f"Cannot reshape token tensor of shape {tuple(token_feats.shape)} into [B, T, S, D] "
+		f"with clip_length={clip_length}."
+	)
+
+
+def extract_head_temporal_features(token_feats: torch.Tensor, head_feats: dict, clip_length: int):
+	"""
+	Extract head-specific temporal features [B, T, D] using per-head query-conditioned
+	attention over spatial tokens at each frame.
+	"""
+	if not isinstance(head_feats, dict):
+		raise TypeError("head_feats must be a dict mapping head name to [B, D] query features.")
+
+	token_grid = _reshape_tokens_to_temporal_grid(token_feats, clip_length)  # [B, T, S, D]
+	feat_dim = token_grid.shape[-1]
+	scale = feat_dim ** -0.5
+	head_temporal = {}
+
+	for head_name, query_feat in head_feats.items():
+		if query_feat.dim() != 2:
+			raise RuntimeError(f"Expected 2D query features for head '{head_name}', got {tuple(query_feat.shape)}.")
+		if query_feat.shape[0] != token_grid.shape[0] or query_feat.shape[1] != feat_dim:
+			raise RuntimeError(
+				f"Head '{head_name}' query shape {tuple(query_feat.shape)} is incompatible with token grid "
+				f"shape {tuple(token_grid.shape)}."
+			)
+		attn_logits = (token_grid * query_feat[:, None, None, :]).sum(dim=-1) * scale  # [B, T, S]
+		attn = attn_logits.softmax(dim=2)
+		head_temporal[head_name] = (attn.unsqueeze(-1) * token_grid).sum(dim=2)
+
+	return head_temporal
+
+
 def extract_motion_features(encoder: nn.Module, inputs: torch.Tensor, clip_length: int):
 	"""Extract concatenated motion-layer tokens and pool spatially to [B, T, D]."""
 	if not hasattr(encoder, "out_layers"):
@@ -447,7 +494,9 @@ def forward_with_features(model, model_type, activation, inputs, args):
 			pooler = getattr(getattr(model_without_ddp, 'probe', None), 'pooler', None)
 			if pooler is not None and hasattr(pooler, 'forward_sequence'):
 				seq_tokens = pooler.forward_sequence(tokens)
-				temporal_probe_feat = reshape_temporal_features(seq_tokens, args.clip_length)
+			else:
+				seq_tokens = tokens
+			temporal_probe_feat = extract_head_temporal_features(seq_tokens, probe_feats, args.clip_length)
 		else:
 			logits, tokens, pooled = model(inputs, return_features=True)
 			feat = reshape_temporal_features(tokens, args.clip_length)
@@ -562,9 +611,11 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 						if args.multi_task:
 							logits = logits[head]
 							cls_feat = cls_feat[head]
-							if temporal_probe_feat is None:
-								raise RuntimeError("Temporal probe features unavailable; check AttentivePooler.forward_sequence.")
-							temporal_probe_crops.append(temporal_probe_feat.unsqueeze(1).detach().cpu())
+							if temporal_probe_feat is None or not isinstance(temporal_probe_feat, dict):
+								raise RuntimeError("Temporal probe features unavailable; expected head-wise temporal features.")
+							if head not in temporal_probe_feat:
+								raise RuntimeError(f"Temporal probe features missing head '{head}'.")
+							temporal_probe_crops.append(temporal_probe_feat[head].unsqueeze(1).detach().cpu())
 						if verb_input_feat is not None:
 							verb_input_crops.append(verb_input_feat.unsqueeze(1).detach().cpu())
 						logits_crops.append(logits.unsqueeze(1).detach().cpu())
@@ -587,9 +638,11 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 					if args.multi_task:
 						logits = logits[head]
 						cls_feat = cls_feat[head]
-						if temporal_probe_feat is None:
-							raise RuntimeError("Temporal probe features unavailable; check AttentivePooler.forward_sequence.")
-						all_temporal_probe_feats.append(temporal_probe_feat.detach().cpu())
+						if temporal_probe_feat is None or not isinstance(temporal_probe_feat, dict):
+							raise RuntimeError("Temporal probe features unavailable; expected head-wise temporal features.")
+						if head not in temporal_probe_feat:
+							raise RuntimeError(f"Temporal probe features missing head '{head}'.")
+						all_temporal_probe_feats.append(temporal_probe_feat[head].detach().cpu())
 					if verb_input_feat is not None:
 						all_verb_input_feats.append(verb_input_feat.detach().cpu())
 					all_outputs.append(logits.detach().cpu())
