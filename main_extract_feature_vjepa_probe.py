@@ -280,42 +280,60 @@ def _reshape_tokens_to_temporal_grid(token_feats: torch.Tensor, clip_length: int
 	token_count = token_feats.shape[1]
 	if token_count % clip_length == 0:
 		tokens_per_frame = token_count // clip_length
-		return token_feats.view(token_feats.shape[0], clip_length, tokens_per_frame, token_feats.shape[-1])
+		return token_feats.reshape(token_feats.shape[0], clip_length, tokens_per_frame, token_feats.shape[-1])
 	if token_count > 1 and (token_count - 1) % clip_length == 0:
 		# Handle layouts with a leading global token.
 		patch_tokens = token_feats[:, 1:, :]
 		tokens_per_frame = patch_tokens.shape[1] // clip_length
-		return patch_tokens.view(token_feats.shape[0], clip_length, tokens_per_frame, token_feats.shape[-1])
+		return patch_tokens.reshape(token_feats.shape[0], clip_length, tokens_per_frame, token_feats.shape[-1])
 	raise RuntimeError(
 		f"Cannot reshape token tensor of shape {tuple(token_feats.shape)} into [B, T, S, D] "
 		f"with clip_length={clip_length}."
 	)
 
 
-def extract_head_temporal_features(token_feats: torch.Tensor, head_feats: dict, clip_length: int):
-	"""
-	Extract head-specific temporal features [B, T, D] using per-head query-conditioned
-	attention over spatial tokens at each frame.
-	"""
-	if not isinstance(head_feats, dict):
-		raise TypeError("head_feats must be a dict mapping head name to [B, D] query features.")
+def _get_token_temporal_length(encoder: nn.Module, inputs: torch.Tensor, clip_length: int):
+	"""Infer temporal token length (tubelet-aware) for reshaping [B, N, D] tokens."""
+	frame_count = clip_length
+	if inputs.ndim == 5:
+		frame_count = int(inputs.shape[2])
+	tubelet_size = int(getattr(encoder, "tubelet_size", 1) or 1)
+	if tubelet_size < 1:
+		tubelet_size = 1
+	return max(1, frame_count // tubelet_size)
 
-	token_grid = _reshape_tokens_to_temporal_grid(token_feats, clip_length)  # [B, T, S, D]
-	feat_dim = token_grid.shape[-1]
-	scale = feat_dim ** -0.5
-	head_temporal = {}
 
-	for head_name, query_feat in head_feats.items():
-		if query_feat.dim() != 2:
-			raise RuntimeError(f"Expected 2D query features for head '{head_name}', got {tuple(query_feat.shape)}.")
-		if query_feat.shape[0] != token_grid.shape[0] or query_feat.shape[1] != feat_dim:
-			raise RuntimeError(
-				f"Head '{head_name}' query shape {tuple(query_feat.shape)} is incompatible with token grid "
-				f"shape {tuple(token_grid.shape)}."
-			)
-		attn_logits = (token_grid * query_feat[:, None, None, :]).sum(dim=-1) * scale  # [B, T, S]
-		attn = attn_logits.softmax(dim=2)
-		head_temporal[head_name] = (attn.unsqueeze(-1) * token_grid).sum(dim=2)
+def extract_head_temporal_features(pooler: nn.Module, token_feats: torch.Tensor, clip_length: int):
+	"""
+	Extract head-specific temporal features [B, T, D] by applying the probe's
+	learned query tokens to each frame's spatial tokens.
+	"""
+	if pooler is None:
+		raise RuntimeError("Probe pooler is missing; cannot extract temporal probe features.")
+	if not hasattr(pooler, "query_tokens") or not hasattr(pooler, "cross_attention_block"):
+		raise RuntimeError("Unexpected pooler implementation; query_tokens/cross_attention_block not found.")
+
+	# Reuse the probe's self-attention sequence refinement when available.
+	if hasattr(pooler, "forward_sequence"):
+		seq_tokens = pooler.forward_sequence(token_feats)
+	else:
+		seq_tokens = token_feats
+
+	token_grid = _reshape_tokens_to_temporal_grid(seq_tokens, clip_length)  # [B, T, S, D]
+	batch_size, temporal_dim, tokens_per_frame, feat_dim = token_grid.shape
+	frame_tokens = token_grid.reshape(batch_size * temporal_dim, tokens_per_frame, feat_dim)
+	query_count = pooler.query_tokens.shape[1]
+	if query_count < 3:
+		raise RuntimeError(f"Expected at least 3 query tokens for verb/noun/action, got {query_count}.")
+
+	queries = pooler.query_tokens.repeat(frame_tokens.shape[0], 1, 1)
+	pooled = pooler.cross_attention_block(queries, frame_tokens)  # [B*T, Q, D]
+	pooled = pooled.reshape(batch_size, temporal_dim, query_count, feat_dim)
+	head_temporal = dict(
+		verb=pooled[:, :, 0, :],
+		noun=pooled[:, :, 1, :],
+		action=pooled[:, :, 2, :],
+	)
 
 	return head_temporal
 
@@ -487,23 +505,20 @@ def forward_with_features(model, model_type, activation, inputs, args):
 	verb_input_feat = None
 	if model_type in VJEPA2_MODEL_SPECS:
 		model_without_ddp = model.module if hasattr(model, 'module') else model
+		encoder = getattr(model_without_ddp, 'encoder', None)
+		if encoder is None:
+			raise RuntimeError("V-JEPA2 model is missing encoder; cannot extract features.")
 		if args.multi_task:
 			logits, tokens, probe_feats = model(inputs, return_features=True)
 			feat = reshape_temporal_features(tokens, args.clip_length)
 			cls_feat = probe_feats
 			pooler = getattr(getattr(model_without_ddp, 'probe', None), 'pooler', None)
-			if pooler is not None and hasattr(pooler, 'forward_sequence'):
-				seq_tokens = pooler.forward_sequence(tokens)
-			else:
-				seq_tokens = tokens
-			temporal_probe_feat = extract_head_temporal_features(seq_tokens, probe_feats, args.clip_length)
+			token_temporal_length = _get_token_temporal_length(encoder, inputs, args.clip_length)
+			temporal_probe_feat = extract_head_temporal_features(pooler, tokens, token_temporal_length)
 		else:
 			logits, tokens, pooled = model(inputs, return_features=True)
 			feat = reshape_temporal_features(tokens, args.clip_length)
 			cls_feat = pooled
-		encoder = getattr(model_without_ddp, 'encoder', None)
-		if encoder is None:
-			raise RuntimeError("V-JEPA2 model is missing encoder; cannot extract motion layers.")
 		verb_input_feat = extract_motion_features(encoder, inputs, args.clip_length)
 	else:
 		logits = model(inputs)
