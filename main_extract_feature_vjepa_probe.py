@@ -50,10 +50,14 @@ from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 
 
 VJEPA2_MODEL_SPECS = {
-	'vjepa2_large': {'hub_name': 'vjepa2_vit_large', 'crop_size': 256},
-	'vjepa2_huge': {'hub_name': 'vjepa2_vit_huge', 'crop_size': 256},
-	'vjepa2_giant': {'hub_name': 'vjepa2_vit_giant', 'crop_size': 256},
-	'vjepa2_giant_384': {'hub_name': 'vjepa2_vit_giant_384', 'crop_size': 384},
+	'vjepa2_large': {'hub_name': 'vjepa2_vit_large', 'crop_size': 256, 'repo_dir': 'vjepa2'},
+	'vjepa2_huge': {'hub_name': 'vjepa2_vit_huge', 'crop_size': 256, 'repo_dir': 'vjepa2'},
+	'vjepa2_giant': {'hub_name': 'vjepa2_vit_giant', 'crop_size': 256, 'repo_dir': 'vjepa2'},
+	'vjepa2_giant_384': {'hub_name': 'vjepa2_vit_giant_384', 'crop_size': 384, 'repo_dir': 'vjepa2'},
+	'vjepa2_1_vit_base_384': {'hub_name': 'vjepa2_1_vit_base_384', 'crop_size': 384, 'repo_dir': 'vjepa2.1'},
+	'vjepa2_1_vit_large_384': {'hub_name': 'vjepa2_1_vit_large_384', 'crop_size': 384, 'repo_dir': 'vjepa2.1'},
+	'vjepa2_1_vit_giant_384': {'hub_name': 'vjepa2_1_vit_giant_384', 'crop_size': 384, 'repo_dir': 'vjepa2.1'},
+	'vjepa2_1_vit_gigantic_384': {'hub_name': 'vjepa2_1_vit_gigantic_384', 'crop_size': 384, 'repo_dir': 'vjepa2.1'},
 }
 VJEPA2_MOTION_LAYERS_1BASED = [25, 27, 29, 31]
 
@@ -70,25 +74,55 @@ def _get_motion_layer_indices(encoder):
 	return motion_layers
 
 
-def _get_vjepa2_attentive_pooler():
-	vjepa2_root = os.path.join(os.path.dirname(__file__), "thirdparty", "vjepa2")
-	if os.path.isdir(vjepa2_root) and vjepa2_root not in sys.path:
-		sys.path.append(vjepa2_root)
+def _supports_motion_features(encoder):
+	if not hasattr(encoder, "out_layers"):
+		return False
+	if hasattr(encoder, "get_num_layers"):
+		return max(idx - 1 for idx in VJEPA2_MOTION_LAYERS_1BASED) < encoder.get_num_layers()
+	return True
+
+
+def _get_vjepa2_repo_root(variant_key: str):
+	if variant_key not in VJEPA2_MODEL_SPECS:
+		raise ValueError(f'Unsupported V-JEPA variant: {variant_key}')
+	repo_dir = VJEPA2_MODEL_SPECS[variant_key].get('repo_dir', 'vjepa2')
+	return os.path.join(os.path.dirname(__file__), "thirdparty", repo_dir)
+
+
+def _ensure_vjepa2_repo_on_path(variant_key: str):
+	repo_root = _get_vjepa2_repo_root(variant_key)
+	if os.path.isdir(repo_root) and repo_root not in sys.path:
+		sys.path.insert(0, repo_root)
+	return repo_root
+
+
+def _get_vjepa2_attentive_pooler(variant_key: str):
+	repo_root = _ensure_vjepa2_repo_on_path(variant_key)
 	try:
 		from src.models.attentive_pooler import AttentivePooler
 	except Exception as exc:
 		raise RuntimeError(
-			"Failed to import V-JEPA2 attentive pooler. "
-			"Ensure thirdparty/vjepa2 is present and on the Python path."
+			"Failed to import V-JEPA attentive pooler. "
+			f"Ensure {repo_root} is present and on the Python path."
 		) from exc
 	return AttentivePooler
 
 
-def _load_vjepa2_encoder(variant_key: str):
+def _load_vjepa2_encoder(variant_key: str, pretrained: bool = True):
 	if variant_key not in VJEPA2_MODEL_SPECS:
-		raise ValueError(f'Unsupported V-JEPA2 variant: {variant_key}')
-	hub_name = VJEPA2_MODEL_SPECS[variant_key]['hub_name']
-	encoder, _ = torch.hub.load('facebookresearch/vjepa2', hub_name)
+		raise ValueError(f'Unsupported V-JEPA variant: {variant_key}')
+	spec = VJEPA2_MODEL_SPECS[variant_key]
+	hub_name = spec['hub_name']
+	repo_root = _ensure_vjepa2_repo_on_path(variant_key)
+	if os.path.isdir(repo_root):
+		try:
+			encoder, _ = torch.hub.load(repo_root, hub_name, source='local', pretrained=pretrained)
+			return encoder
+		except Exception as exc:
+			if not pretrained:
+				raise
+			print(f"Local V-JEPA hub load failed for {variant_key} ({exc}). Falling back to facebookresearch/vjepa2.")
+	encoder, _ = torch.hub.load('facebookresearch/vjepa2', hub_name, pretrained=pretrained)
 	return encoder
 
 
@@ -108,9 +142,9 @@ def load_checkpoint(checkpoint_path: str):
 class VJEPA2FeatureExtractor(nn.Module):
 	"""Thin wrapper that exposes logits and token-level features from V-JEPA2."""
 
-	def __init__(self, variant_key: str, num_classes: int, dropout: float = 0.5):
+	def __init__(self, variant_key: str, num_classes: int, dropout: float = 0.5, pretrained_backbone: bool = True):
 		super().__init__()
-		self.encoder = _load_vjepa2_encoder(variant_key)
+		self.encoder = _load_vjepa2_encoder(variant_key, pretrained=pretrained_backbone)
 		self.num_features = self.encoder.embed_dim
 		self.classifier = nn.Sequential(
 			nn.Dropout(p=dropout),
@@ -131,6 +165,7 @@ class VJEPA2MultiTaskProbeHead(nn.Module):
 
 	def __init__(
 		self,
+		variant_key: str,
 		embed_dim: int,
 		num_verb_classes: int,
 		num_noun_classes: int,
@@ -142,7 +177,7 @@ class VJEPA2MultiTaskProbeHead(nn.Module):
 		use_activation_checkpointing: bool = True,
 	):
 		super().__init__()
-		AttentivePooler = _get_vjepa2_attentive_pooler()
+		AttentivePooler = _get_vjepa2_attentive_pooler(variant_key)
 		self.pooler = AttentivePooler(
 			num_queries=3,
 			embed_dim=embed_dim,
@@ -183,11 +218,13 @@ class VJEPA2MultiTaskProbeClassifier(nn.Module):
 		probe_mlp_ratio: float = 4.0,
 		probe_dropout: float = 0.0,
 		use_activation_checkpointing: bool = True,
+		pretrained_backbone: bool = True,
 	):
 		super().__init__()
-		self.encoder = _load_vjepa2_encoder(variant_key)
+		self.encoder = _load_vjepa2_encoder(variant_key, pretrained=pretrained_backbone)
 		self.num_features = self.encoder.embed_dim
 		self.probe = VJEPA2MultiTaskProbeHead(
+			variant_key=variant_key,
 			embed_dim=self.num_features,
 			num_verb_classes=num_verb_classes,
 			num_noun_classes=num_noun_classes,
@@ -520,7 +557,8 @@ def forward_with_features(model, model_type, activation, inputs, args):
 			logits, tokens, pooled = model(inputs, return_features=True)
 			feat = reshape_temporal_features(tokens, args.clip_length)
 			cls_feat = pooled
-		verb_input_feat = extract_motion_features(encoder, inputs, args.clip_length)
+		if _supports_motion_features(encoder):
+			verb_input_feat = extract_motion_features(encoder, inputs, args.clip_length)
 	else:
 		logits = model(inputs)
 		token_output = activation['tokens']
@@ -693,7 +731,10 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 		all_temporal_probe_feats = torch.cat(all_temporal_probe_feats)
 		all_narration_row_index = torch.cat([value.view(-1) for value in all_narration_row_index], dim=0)
 	if all_verb_input_feats is not None:
-		all_verb_input_feats = torch.cat(all_verb_input_feats)
+		if len(all_verb_input_feats) > 0:
+			all_verb_input_feats = torch.cat(all_verb_input_feats)
+		else:
+			all_verb_input_feats = None
 
 	if args.multi_task:
 		save_name = f"{args.dataset}_{subset}_{head}_feat.pt"
@@ -849,6 +890,15 @@ def main(args):
 	# This flag controls label selection inside dataset
 	args.egtea_finetune_type = 'action' if args.multi_task else args.task_type
 
+	ckpt_path = args.resume or args.pretrain_model
+	ckpt_is_empty = not ckpt_path or ckpt_path.strip().lower() in {'none', 'null', 'nil'}
+	pretrained_backbone = args.skip_checkpoint or ckpt_is_empty
+	if args.model_type in VJEPA2_MODEL_SPECS:
+		if pretrained_backbone:
+			print("Initializing V-JEPA backbone from default pretrained weights.")
+		else:
+			print("Initializing V-JEPA backbone architecture only; external checkpoint will provide weights.")
+
 	# Build model
 	if args.model_type == 'mvit_spatial':
 		model = MViT_Spatial(args.num_classes, dropout=args.dropout_ratio)
@@ -866,9 +916,12 @@ def main(args):
 				probe_mlp_ratio=args.probe_mlp_ratio,
 				probe_dropout=args.probe_dropout,
 				use_activation_checkpointing=args.probe_use_activation_checkpointing,
+				pretrained_backbone=pretrained_backbone,
 			)
 		else:
-			model = VJEPA2FeatureExtractor(args.model_type, args.num_classes, dropout=args.dropout_ratio)
+			model = VJEPA2FeatureExtractor(
+				args.model_type, args.num_classes, dropout=args.dropout_ratio, pretrained_backbone=pretrained_backbone
+			)
 	else:
 		raise ValueError(f'Unknown model type: {args.model_type}')
 

@@ -13,6 +13,7 @@ Outputs follow the same format as the original extractor:
 import argparse
 from collections import OrderedDict
 import os
+import sys
 import time
 
 import torch
@@ -43,11 +44,47 @@ from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 
 
 VJEPA2_MODEL_SPECS = {
-	'vjepa2_large': {'hub_name': 'vjepa2_vit_large', 'crop_size': 256},
-	'vjepa2_huge': {'hub_name': 'vjepa2_vit_huge', 'crop_size': 256},
-	'vjepa2_giant': {'hub_name': 'vjepa2_vit_giant', 'crop_size': 256},
-	'vjepa2_giant_384': {'hub_name': 'vjepa2_vit_giant_384', 'crop_size': 384},
+	'vjepa2_large': {'hub_name': 'vjepa2_vit_large', 'crop_size': 256, 'repo_dir': 'vjepa2'},
+	'vjepa2_huge': {'hub_name': 'vjepa2_vit_huge', 'crop_size': 256, 'repo_dir': 'vjepa2'},
+	'vjepa2_giant': {'hub_name': 'vjepa2_vit_giant', 'crop_size': 256, 'repo_dir': 'vjepa2'},
+	'vjepa2_giant_384': {'hub_name': 'vjepa2_vit_giant_384', 'crop_size': 384, 'repo_dir': 'vjepa2'},
+	'vjepa2_1_vit_base_384': {'hub_name': 'vjepa2_1_vit_base_384', 'crop_size': 384, 'repo_dir': 'vjepa2.1'},
+	'vjepa2_1_vit_large_384': {'hub_name': 'vjepa2_1_vit_large_384', 'crop_size': 384, 'repo_dir': 'vjepa2.1'},
+	'vjepa2_1_vit_giant_384': {'hub_name': 'vjepa2_1_vit_giant_384', 'crop_size': 384, 'repo_dir': 'vjepa2.1'},
+	'vjepa2_1_vit_gigantic_384': {'hub_name': 'vjepa2_1_vit_gigantic_384', 'crop_size': 384, 'repo_dir': 'vjepa2.1'},
 }
+
+
+def _get_vjepa2_repo_root(variant_key: str):
+	if variant_key not in VJEPA2_MODEL_SPECS:
+		raise ValueError(f'Unsupported V-JEPA variant: {variant_key}')
+	repo_dir = VJEPA2_MODEL_SPECS[variant_key].get('repo_dir', 'vjepa2')
+	return os.path.join(os.path.dirname(__file__), "thirdparty", repo_dir)
+
+
+def _ensure_vjepa2_repo_on_path(variant_key: str):
+	repo_root = _get_vjepa2_repo_root(variant_key)
+	if os.path.isdir(repo_root) and repo_root not in sys.path:
+		sys.path.insert(0, repo_root)
+	return repo_root
+
+
+def _load_vjepa2_encoder(variant_key: str, pretrained: bool = True):
+	if variant_key not in VJEPA2_MODEL_SPECS:
+		raise ValueError(f'Unsupported V-JEPA variant: {variant_key}')
+	spec = VJEPA2_MODEL_SPECS[variant_key]
+	hub_name = spec['hub_name']
+	repo_root = _ensure_vjepa2_repo_on_path(variant_key)
+	if os.path.isdir(repo_root):
+		try:
+			encoder, _ = torch.hub.load(repo_root, hub_name, source='local', pretrained=pretrained)
+			return encoder
+		except Exception as exc:
+			if not pretrained:
+				raise
+			print(f"Local V-JEPA hub load failed for {variant_key} ({exc}). Falling back to facebookresearch/vjepa2.")
+	encoder, _ = torch.hub.load('facebookresearch/vjepa2', hub_name, pretrained=pretrained)
+	return encoder
 
 
 def load_checkpoint(checkpoint_path: str):
@@ -66,16 +103,10 @@ def load_checkpoint(checkpoint_path: str):
 class VJEPA2FeatureExtractor(nn.Module):
 	"""Thin wrapper that exposes logits and token-level features from V-JEPA2."""
 
-	def __init__(self, variant_key: str, num_classes: int, dropout: float = 0.5):
+	def __init__(self, variant_key: str, num_classes: int, dropout: float = 0.5, pretrained_backbone: bool = True):
 		super().__init__()
-		if variant_key not in VJEPA2_MODEL_SPECS:
-			raise ValueError(f'Unsupported V-JEPA2 variant: {variant_key}')
-
-		hub_name = VJEPA2_MODEL_SPECS[variant_key]['hub_name']
-		encoder, _ = torch.hub.load('facebookresearch/vjepa2', hub_name)
-
-		self.encoder = encoder
-		self.num_features = encoder.embed_dim
+		self.encoder = _load_vjepa2_encoder(variant_key, pretrained=pretrained_backbone)
+		self.num_features = self.encoder.embed_dim
 		self.classifier = nn.Sequential(
 			nn.Dropout(p=dropout),
 			nn.Linear(self.num_features, num_classes),
@@ -440,13 +471,24 @@ def main(args):
 	# This flag controls label selection inside dataset
 	args.egtea_finetune_type = args.task_type
 
+	ckpt_path = args.resume or args.pretrain_model
+	ckpt_is_empty = not ckpt_path or ckpt_path.strip().lower() in {'none', 'null', 'nil'}
+	pretrained_backbone = args.skip_checkpoint or ckpt_is_empty
+	if args.model_type in VJEPA2_MODEL_SPECS:
+		if pretrained_backbone:
+			print("Initializing V-JEPA backbone from default pretrained weights.")
+		else:
+			print("Initializing V-JEPA backbone architecture only; external checkpoint will provide weights.")
+
 	# Build model
 	if args.model_type == 'mvit_spatial':
 		model = MViT_Spatial(args.num_classes, dropout=args.dropout_ratio)
 	elif args.model_type == 'mvit_temporal':
 		model = MViT_Temporal(args.num_classes, dropout=args.dropout_ratio)
 	elif args.model_type in VJEPA2_MODEL_SPECS:
-		model = VJEPA2FeatureExtractor(args.model_type, args.num_classes, dropout=args.dropout_ratio)
+		model = VJEPA2FeatureExtractor(
+			args.model_type, args.num_classes, dropout=args.dropout_ratio, pretrained_backbone=pretrained_backbone
+		)
 	else:
 		raise ValueError(f'Unknown model type: {args.model_type}')
 
