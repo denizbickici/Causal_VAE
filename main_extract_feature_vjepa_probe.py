@@ -402,19 +402,21 @@ class EK100MultiTaskDataset(VideoCaptionDatasetBase):
 		self.clip_length = clip_length
 		self.clip_stride = clip_stride
 		self.sparse_sample = sparse_sample
-
-		if filter_actions and self.label_maps is not None:
-			before = len(self.samples)
-			filtered = []
-			for sample in self.samples:
-				verb = str(sample[4])
-				noun = str(sample[5])
-				if f"{verb}:{noun}" in self.label_maps["action"]:
-					filtered.append(sample)
-			self.samples = filtered
-			dropped = before - len(self.samples)
-			if dropped > 0:
-				print(f"=> Filtered {dropped} validation samples with unseen actions")
+		self.sample_meta = []
+		with open(metadata, newline='') as handle:
+			reader = csv.DictReader(handle)
+			for row_index, row in enumerate(reader):
+				self.sample_meta.append({
+					'narration_id': row.get('narration_id', ''),
+					'narration_row_index': row_index,
+					'video_id': row.get('video_id', ''),
+				})
+		if len(self.sample_meta) != len(self.samples):
+			raise RuntimeError(
+				f"Metadata/sample length mismatch: metadata={len(self.sample_meta)} samples={len(self.samples)}"
+			)
+		if filter_actions:
+			print('=> filter_actions requested but disabled; keeping all validation samples for alignment with LaViLa')
 
 	def __getitem__(self, i):
 		vid_path, start_frame, end_frame, _, verb, noun = self.samples[i]
@@ -429,9 +431,8 @@ class EK100MultiTaskDataset(VideoCaptionDatasetBase):
 		action_key = f"{verb_key}:{noun_key}"
 		verb_label = self.label_maps["verb"][verb_key]
 		noun_label = self.label_maps["noun"][noun_key]
-		action_label = self.label_maps["action"][action_key]
-
-		return frames, verb_label, noun_label, action_label
+		action_label = self.label_maps["action"].get(action_key, -1)
+		return frames, verb_label, noun_label, action_label, self.sample_meta[i]
 
 
 def build_transforms(args):
@@ -561,6 +562,9 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 	all_outputs, all_targets, all_feats, all_cls_feats = [], [], [], []
 	all_temporal_probe_feats = [] if args.multi_task else None
 	all_verb_input_feats = [] if args.model_type in VJEPA2_MODEL_SPECS else None
+	all_narration_ids = [] if args.multi_task else None
+	all_narration_row_index = [] if args.multi_task else None
+	all_video_ids = [] if args.multi_task else None
 	end = time.time()
 
 	with torch.no_grad():
@@ -602,13 +606,20 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 				all_targets.append(target_gpu.detach().cpu())
 			else:
 				if args.multi_task:
-					images, verb_target, noun_target, action_target = batch_data
+					images, verb_target, noun_target, action_target, sample_meta = batch_data
 					target_map = {
 						"verb": verb_target,
 						"noun": noun_target,
 						"action": action_target,
 					}
 					target = target_map[head]
+					all_narration_ids.extend(list(sample_meta["narration_id"]))
+					row_index_value = sample_meta["narration_row_index"]
+					if torch.is_tensor(row_index_value):
+						all_narration_row_index.append(row_index_value.detach().cpu())
+					else:
+						all_narration_row_index.append(torch.as_tensor(row_index_value))
+					all_video_ids.extend(list(sample_meta["video_id"]))
 				else:
 					images, target = batch_data
 				target_gpu = target.cuda(args.gpu, non_blocking=True)
@@ -680,6 +691,7 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 	all_targets = torch.cat(all_targets)
 	if args.multi_task:
 		all_temporal_probe_feats = torch.cat(all_temporal_probe_feats)
+		all_narration_row_index = torch.cat([value.view(-1) for value in all_narration_row_index], dim=0)
 	if all_verb_input_feats is not None:
 		all_verb_input_feats = torch.cat(all_verb_input_feats)
 
@@ -696,6 +708,9 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 	}
 	if args.multi_task:
 		save_payload['temporal_probe_feats'] = all_temporal_probe_feats
+		save_payload['narration_ids'] = all_narration_ids
+		save_payload['narration_row_index'] = all_narration_row_index
+		save_payload['video_ids'] = all_video_ids
 	if all_verb_input_feats is not None:
 		save_payload['verb_input_feats'] = all_verb_input_feats
 	torch.save(save_payload, save_path)
@@ -708,6 +723,8 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 	print(f"  cls_feats: {all_cls_feats.shape}")
 	if args.multi_task:
 		print(f"  temporal_probe_feats: {all_temporal_probe_feats.shape}")
+		print(f"  narration_ids: {len(all_narration_ids)}")
+		print(f"  narration_row_index: {all_narration_row_index.shape}")
 	if all_verb_input_feats is not None:
 		print(f"  verb_input_feats: {all_verb_input_feats.shape}")
 	print(f"  outputs: {all_outputs.shape}")
@@ -927,7 +944,7 @@ def main(args):
 			transform=val_transform,
 			is_training=False,
 			label_maps=label_maps,
-			filter_actions=True,
+			filter_actions=False,
 			clip_length=args.clip_length,
 			clip_stride=args.clip_stride,
 			sparse_sample=args.sparse_sample,
