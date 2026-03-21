@@ -54,39 +54,54 @@ from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 
 
 VJEPA2_MODEL_SPECS = {
-    'vjepa2_large': {'hub_name': 'vjepa2_vit_large', 'crop_size': 256},
-    'vjepa2_huge': {'hub_name': 'vjepa2_vit_huge', 'crop_size': 256},
-    'vjepa2_giant': {'hub_name': 'vjepa2_vit_giant', 'crop_size': 256},
-    'vjepa2_giant_384': {'hub_name': 'vjepa2_vit_giant_384', 'crop_size': 384},
+    'vjepa2_large': {'hub_name': 'vjepa2_vit_large', 'crop_size': 256, 'repo_dir': 'vjepa2'},
+    'vjepa2_huge': {'hub_name': 'vjepa2_vit_huge', 'crop_size': 256, 'repo_dir': 'vjepa2'},
+    'vjepa2_giant': {'hub_name': 'vjepa2_vit_giant', 'crop_size': 256, 'repo_dir': 'vjepa2'},
+    'vjepa2_giant_384': {'hub_name': 'vjepa2_vit_giant_384', 'crop_size': 384, 'repo_dir': 'vjepa2'},
+    'vjepa2_1_vit_base_384': {'hub_name': 'vjepa2_1_vit_base_384', 'crop_size': 384, 'repo_dir': 'vjepa2.1'},
+    'vjepa2_1_vit_large_384': {'hub_name': 'vjepa2_1_vit_large_384', 'crop_size': 384, 'repo_dir': 'vjepa2.1'},
+    'vjepa2_1_vit_giant_384': {'hub_name': 'vjepa2_1_vit_giant_384', 'crop_size': 384, 'repo_dir': 'vjepa2.1'},
+    'vjepa2_1_vit_gigantic_384': {'hub_name': 'vjepa2_1_vit_gigantic_384', 'crop_size': 384, 'repo_dir': 'vjepa2.1'},
 }
 
 
-def _get_vjepa2_attentive_pooler():
-    vjepa2_root = os.path.join(os.path.dirname(__file__), "thirdparty", "vjepa2")
-    if os.path.isdir(vjepa2_root) and vjepa2_root not in sys.path:
-        sys.path.append(vjepa2_root)
+def _get_vjepa2_repo_root(variant_key):
+    if variant_key not in VJEPA2_MODEL_SPECS:
+        raise ValueError(f'Unsupported V-JEPA variant: {variant_key}')
+    repo_dir = VJEPA2_MODEL_SPECS[variant_key].get('repo_dir', 'vjepa2')
+    return os.path.join(os.path.dirname(__file__), 'thirdparty', repo_dir)
+
+
+def _ensure_vjepa2_repo_on_path(variant_key):
+    repo_root = _get_vjepa2_repo_root(variant_key)
+    if os.path.isdir(repo_root) and repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    return repo_root
+
+
+def _get_vjepa2_attentive_pooler(variant_key):
+    repo_root = _ensure_vjepa2_repo_on_path(variant_key)
     try:
         from src.models.attentive_pooler import AttentivePooler
     except Exception as exc:
         raise RuntimeError(
-            "Failed to import V-JEPA2 attentive pooler. "
-            "Ensure thirdparty/vjepa2 is present and on the Python path."
+            'Failed to import V-JEPA attentive pooler. '
+            f'Ensure {repo_root} is present and on the Python path.'
         ) from exc
     return AttentivePooler
 
 
-def _get_sigmoid_focal_loss():
-    vjepa2_root = os.path.join(os.path.dirname(__file__), "thirdparty", "vjepa2")
-    if os.path.isdir(vjepa2_root) and vjepa2_root not in sys.path:
-        sys.path.append(vjepa2_root)
+def _get_sigmoid_focal_loss(variant_key):
+    repo_root = _ensure_vjepa2_repo_on_path(variant_key)
     try:
         from evals.action_anticipation_frozen.losses import sigmoid_focal_loss
     except Exception as exc:
         raise RuntimeError(
-            "Failed to import V-JEPA2 sigmoid focal loss. "
-            "Ensure thirdparty/vjepa2 is present and on the Python path."
+            'Failed to import V-JEPA sigmoid focal loss. '
+            f'Ensure {repo_root} is present and on the Python path.'
         ) from exc
     return sigmoid_focal_loss
+
 
 
 def build_default_multihead_kwargs():
@@ -197,20 +212,29 @@ def init_multihead_opt(classifiers, iterations_per_epoch, opt_kwargs, num_epochs
     return optimizers, scalers, schedulers, wd_schedulers
 
 
-def _load_vjepa2_encoder(variant_key):
+def _load_vjepa2_encoder(variant_key, pretrained=True):
     if variant_key not in VJEPA2_MODEL_SPECS:
-        raise ValueError(f'Unsupported V-JEPA2 variant: {variant_key}')
+        raise ValueError(f'Unsupported V-JEPA variant: {variant_key}')
     hub_name = VJEPA2_MODEL_SPECS[variant_key]['hub_name']
-    encoder, _ = torch.hub.load('facebookresearch/vjepa2', hub_name)
+    repo_root = _ensure_vjepa2_repo_on_path(variant_key)
+    if os.path.isdir(repo_root):
+        try:
+            encoder, _ = torch.hub.load(repo_root, hub_name, source='local', pretrained=pretrained)
+            return encoder
+        except Exception as exc:
+            if not pretrained:
+                raise
+            print(f"Local V-JEPA hub load failed for {variant_key} ({exc}). Falling back to facebookresearch/vjepa2.")
+    encoder, _ = torch.hub.load('facebookresearch/vjepa2', hub_name, pretrained=pretrained)
     return encoder
 
 
 class VJEPA2MeanPoolClassifier(nn.Module):
     """Mean-pool classifier on top of a V-JEPA2 encoder."""
 
-    def __init__(self, variant_key, num_classes, dropout=0.5):
+    def __init__(self, variant_key, num_classes, dropout=0.5, pretrained_backbone=True):
         super().__init__()
-        self.encoder = _load_vjepa2_encoder(variant_key)
+        self.encoder = _load_vjepa2_encoder(variant_key, pretrained=pretrained_backbone)
         self.num_features = self.encoder.embed_dim
         self.classifier = nn.Sequential(
             nn.Dropout(p=dropout),
@@ -228,6 +252,7 @@ class VJEPA2ProbeHead(nn.Module):
 
     def __init__(
         self,
+        variant_key,
         embed_dim,
         num_classes,
         num_heads,
@@ -237,7 +262,7 @@ class VJEPA2ProbeHead(nn.Module):
         use_activation_checkpointing=True,
     ):
         super().__init__()
-        AttentivePooler = _get_vjepa2_attentive_pooler()
+        AttentivePooler = _get_vjepa2_attentive_pooler(variant_key)
         self.pooler = AttentivePooler(
             num_queries=1,
             embed_dim=embed_dim,
@@ -260,6 +285,7 @@ class VJEPA2MultiTaskProbeHead(nn.Module):
 
     def __init__(
         self,
+        variant_key,
         embed_dim,
         num_verb_classes,
         num_noun_classes,
@@ -271,7 +297,7 @@ class VJEPA2MultiTaskProbeHead(nn.Module):
         use_activation_checkpointing=True,
     ):
         super().__init__()
-        AttentivePooler = _get_vjepa2_attentive_pooler()
+        AttentivePooler = _get_vjepa2_attentive_pooler(variant_key)
         self.pooler = AttentivePooler(
             num_queries=3,
             embed_dim=embed_dim,
@@ -307,9 +333,10 @@ class VJEPA2ProbeClassifier(nn.Module):
         probe_dropout=0.0,
         use_activation_checkpointing=True,
         freeze_encoder=True,
+        pretrained_backbone=True,
     ):
         super().__init__()
-        self.encoder = _load_vjepa2_encoder(variant_key)
+        self.encoder = _load_vjepa2_encoder(variant_key, pretrained=pretrained_backbone)
         self.num_features = self.encoder.embed_dim
         self.freeze_encoder = freeze_encoder
         if freeze_encoder:
@@ -318,6 +345,7 @@ class VJEPA2ProbeClassifier(nn.Module):
             self.encoder.eval()
 
         self.probe = VJEPA2ProbeHead(
+            variant_key=variant_key,
             embed_dim=self.num_features,
             num_classes=num_classes,
             num_heads=probe_num_heads,
@@ -357,9 +385,10 @@ class VJEPA2MultiTaskProbeClassifier(nn.Module):
         probe_dropout=0.0,
         use_activation_checkpointing=True,
         freeze_encoder=True,
+        pretrained_backbone=True,
     ):
         super().__init__()
-        self.encoder = _load_vjepa2_encoder(variant_key)
+        self.encoder = _load_vjepa2_encoder(variant_key, pretrained=pretrained_backbone)
         self.num_features = self.encoder.embed_dim
         self.freeze_encoder = freeze_encoder
         if freeze_encoder:
@@ -368,6 +397,7 @@ class VJEPA2MultiTaskProbeClassifier(nn.Module):
             self.encoder.eval()
 
         self.probe = VJEPA2MultiTaskProbeHead(
+            variant_key=variant_key,
             embed_dim=self.num_features,
             num_verb_classes=num_verb_classes,
             num_noun_classes=num_noun_classes,
@@ -1570,6 +1600,12 @@ def main(args):
         args.egtea_finetune_type = 'action' if args.multi_task else args.task_type
     
     print(f"=> Creating model: {args.model_type}")
+    pretrained_backbone = not (bool(args.pretrain_model) or bool(args.resume))
+    if args.model_type in VJEPA2_MODEL_SPECS:
+        if pretrained_backbone:
+            print("=> Initializing V-JEPA backbone from default pretrained weights")
+        else:
+            print("=> Initializing V-JEPA backbone architecture only; external checkpoint will provide weights")
     if args.multi_task:
         print(
             "=> Multi-task classes (action/verb/noun): "
@@ -1599,9 +1635,10 @@ def main(args):
                     probe_dropout=args.probe_dropout,
                     use_activation_checkpointing=args.probe_use_activation_checkpointing,
                     freeze_encoder=not args.unfreeze_encoder,
+                    pretrained_backbone=pretrained_backbone,
                 )
             elif args.vjepa2_head == 'meanpool':
-                model = VJEPA2MeanPoolClassifier(args.model_type, args.num_classes, dropout=args.dropout_ratio)
+                model = VJEPA2MeanPoolClassifier(args.model_type, args.num_classes, dropout=args.dropout_ratio, pretrained_backbone=pretrained_backbone)
             else:
                 model = VJEPA2ProbeClassifier(
                     args.model_type,
@@ -1612,6 +1649,7 @@ def main(args):
                     probe_dropout=args.probe_dropout,
                     use_activation_checkpointing=args.probe_use_activation_checkpointing,
                     freeze_encoder=not args.unfreeze_encoder,
+                    pretrained_backbone=pretrained_backbone,
                 )
         else:
             raise ValueError(f'Unknown model type: {args.model_type}')
@@ -1825,7 +1863,7 @@ def main(args):
         if dist_utils.is_main_process():
             if args.class_weight != 'none' or args.label_smoothing > 0:
                 print("=> Using focal loss; ignoring class weights and label smoothing.")
-        focal_loss = _get_sigmoid_focal_loss()
+        focal_loss = _get_sigmoid_focal_loss(args.model_type)
         if args.multi_task:
             criterion = {"verb": focal_loss, "noun": focal_loss, "action": focal_loss}
         else:
@@ -1883,7 +1921,7 @@ def main(args):
     if args.multihead_sweep:
         amp_enabled = args.use_bfloat16 and not args.disable_amp
 
-        encoder = _load_vjepa2_encoder(args.model_type)
+        encoder = _load_vjepa2_encoder(args.model_type, pretrained=pretrained_backbone)
         if args.pretrain_model:
             print(f"=> Loading pretrained encoder: {args.pretrain_model}")
             checkpoint = load_checkpoint(args.pretrain_model)
@@ -1918,6 +1956,7 @@ def main(args):
         if args.multi_task:
             classifiers = [
                 VJEPA2MultiTaskProbeHead(
+                    variant_key=args.model_type,
                     embed_dim=encoder.embed_dim,
                     num_verb_classes=args.num_classes_verb,
                     num_noun_classes=args.num_classes_noun,
@@ -1933,6 +1972,7 @@ def main(args):
         else:
             classifiers = [
                 VJEPA2ProbeHead(
+                    variant_key=args.model_type,
                     embed_dim=encoder.embed_dim,
                     num_classes=args.num_classes,
                     num_heads=args.probe_num_heads,
