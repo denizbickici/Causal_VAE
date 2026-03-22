@@ -690,7 +690,7 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 					all_cls_feats.append(torch.cat(cls_crops, dim=1))
 					if args.multi_task:
 						all_temporal_probe_feats.append(torch.cat(temporal_probe_crops, dim=1))
-					if verb_input_crops is not None:
+					if verb_input_crops is not None and len(verb_input_crops) > 0:
 						all_verb_input_feats.append(torch.cat(verb_input_crops, dim=1))
 				else:
 					images = images.cuda(args.gpu, non_blocking=True)
@@ -830,6 +830,7 @@ def get_args_parser():
 	# System
 	parser.add_argument('--print-freq', default=50, type=int, help='print frequency')
 	parser.add_argument('--workers', default=4, type=int, help='data loading workers')
+	parser.add_argument('--val-only', action='store_true', help='extract only validation/test features and skip train extraction')
 	parser.add_argument('--seed', default=0, type=int)
 	parser.add_argument('--gpu', default=None, type=int, help='GPU id to use')
 
@@ -1034,12 +1035,14 @@ def main(args):
 
 	# Extract features
 	if args.multi_task:
-		extract_split(train_loader, model, flow_model, args, subset='train', head='verb')
-		extract_split(train_loader, model, flow_model, args, subset='train', head='noun')
+		if not args.val_only:
+			extract_split(train_loader, model, flow_model, args, subset='train', head='verb')
+			extract_split(train_loader, model, flow_model, args, subset='train', head='noun')
 		extract_split(val_loader, model, flow_model, args, subset='test', head='verb')
 		extract_split(val_loader, model, flow_model, args, subset='test', head='noun')
 	else:
-		extract_split(train_loader, model, flow_model, args, subset='train')
+		if not args.val_only:
+			extract_split(train_loader, model, flow_model, args, subset='train')
 		extract_split(val_loader, model, flow_model, args, subset='test')
 
 

@@ -818,18 +818,8 @@ class EK100MultiTaskDataset(VideoCaptionDatasetBase):
         self.clip_stride = clip_stride
         self.sparse_sample = sparse_sample
 
-        if filter_actions and self.label_maps is not None:
-            before = len(self.samples)
-            filtered = []
-            for sample in self.samples:
-                verb = str(sample[4])
-                noun = str(sample[5])
-                if f"{verb}:{noun}" in self.label_maps["action"]:
-                    filtered.append(sample)
-            self.samples = filtered
-            dropped = before - len(self.samples)
-            if dropped > 0:
-                print(f"=> Filtered {dropped} validation samples with unseen actions")
+        if filter_actions:
+            print('=> filter_actions requested but disabled; keeping all validation samples for alignment with LaViLa')
 
     def __getitem__(self, i):
         vid_path, start_frame, end_frame, _, verb, noun = self.samples[i]
@@ -844,7 +834,7 @@ class EK100MultiTaskDataset(VideoCaptionDatasetBase):
         action_key = f"{verb_key}:{noun_key}"
         verb_label = self.label_maps["verb"][verb_key]
         noun_label = self.label_maps["noun"][noun_key]
-        action_label = self.label_maps["action"][action_key]
+        action_label = self.label_maps["action"].get(action_key, -1)
 
         return frames, verb_label, noun_label, action_label
 
@@ -854,6 +844,34 @@ def _average_multitask_logits(logits_list):
         raise ValueError("Expected non-empty logits list for multi-task averaging.")
     keys = logits_list[0].keys()
     return {k: torch.mean(torch.stack([o[k] for o in logits_list]), dim=0) for k in keys}
+
+
+def _masked_multitask_loss(logits, target, criterion_fn):
+    valid = target >= 0
+    if bool(valid.all()):
+        return criterion_fn(logits, target)
+    if not bool(valid.any()):
+        return logits.sum() * 0.0
+    return criterion_fn(logits[valid], target[valid])
+
+
+def _masked_multitask_accuracy(logits, target, topk=(1,)):
+    valid = target >= 0
+    if bool(valid.all()):
+        return accuracy(logits, target, topk=topk), int(target.size(0))
+    valid_count = int(valid.sum().item())
+    if valid_count == 0:
+        zeros = [torch.zeros(1, device=logits.device) for _ in topk]
+        return zeros, 0
+    return accuracy(logits[valid], target[valid], topk=topk), valid_count
+
+
+def _append_valid_action_batch(outputs_store, targets_store, logits, target):
+    valid = target >= 0
+    if bool(valid.any()):
+        outputs_store.append(logits[valid].detach().cpu())
+        targets_store.append(target[valid].detach().cpu())
+    return int(valid.sum().item())
 
 
 def train(train_loader, model, flow_model, criterion, optimizer, scaler, epoch, lr_schedule, args):
@@ -944,7 +962,7 @@ def train(train_loader, model, flow_model, criterion, optimizer, scaler, epoch, 
             if args.multi_task:
                 loss_verb = criterion["verb"](output["verb"], verb_target)
                 loss_noun = criterion["noun"](output["noun"], noun_target)
-                loss_action = criterion["action"](output["action"], action_target)
+                loss_action = _masked_multitask_loss(output["action"], action_target, criterion["action"])
                 loss = (
                     args.verb_loss_weight * loss_verb
                     + args.noun_loss_weight * loss_noun
@@ -955,14 +973,15 @@ def train(train_loader, model, flow_model, criterion, optimizer, scaler, epoch, 
         
         # Measure accuracy and record loss
         if args.multi_task:
-            acc1_action, acc5_action = accuracy(output["action"], action_target, topk=(1, 5))
+            (acc1_action, acc5_action), action_count = _masked_multitask_accuracy(output["action"], action_target, topk=(1, 5))
             acc1_verb, acc5_verb = accuracy(output["verb"], verb_target, topk=(1, 5))
             acc1_noun, acc5_noun = accuracy(output["noun"], noun_target, topk=(1, 5))
             losses.update(loss.item(), images.size(0))
-            top1_action.update(acc1_action.item(), images.size(0))
+            if action_count > 0:
+                top1_action.update(acc1_action.item(), action_count)
+                top5_action.update(acc5_action.item(), action_count)
             top1_verb.update(acc1_verb.item(), images.size(0))
             top1_noun.update(acc1_noun.item(), images.size(0))
-            top5_action.update(acc5_action.item(), images.size(0))
             top5_verb.update(acc5_verb.item(), images.size(0))
             top5_noun.update(acc5_noun.item(), images.size(0))
         else:
@@ -1095,7 +1114,7 @@ def train_multihead_epoch(
                 for o in outputs:
                     loss_verb = criterion["verb"](o["verb"], verb_target)
                     loss_noun = criterion["noun"](o["noun"], noun_target)
-                    loss_action = criterion["action"](o["action"], action_target)
+                    loss_action = _masked_multitask_loss(o["action"], action_target, criterion["action"])
                     total_loss = (
                         args.verb_loss_weight * loss_verb
                         + args.noun_loss_weight * loss_noun
@@ -1120,14 +1139,17 @@ def train_multihead_epoch(
 
         with torch.no_grad():
             if args.multi_task:
-                action_accs = [accuracy(o["action"], action_target, topk=(1, 5)) for o in outputs]
+                action_acc_stats = [_masked_multitask_accuracy(o["action"], action_target, topk=(1, 5)) for o in outputs]
+                action_accs = [acc for acc, _ in action_acc_stats]
+                action_count = action_acc_stats[0][1] if action_acc_stats else 0
                 verb_accs = [accuracy(o["verb"], verb_target, topk=(1, 5)) for o in outputs]
                 noun_accs = [accuracy(o["noun"], noun_target, topk=(1, 5)) for o in outputs]
 
-                for meter, acc in zip(per_head_top1_action, action_accs):
-                    meter.update(acc[0].item(), batch_size)
-                for meter, acc in zip(per_head_top5_action, action_accs):
-                    meter.update(acc[1].item(), batch_size)
+                if action_count > 0:
+                    for meter, acc in zip(per_head_top1_action, action_accs):
+                        meter.update(acc[0].item(), action_count)
+                    for meter, acc in zip(per_head_top5_action, action_accs):
+                        meter.update(acc[1].item(), action_count)
                 for meter, acc in zip(per_head_top1_verb, verb_accs):
                     meter.update(acc[0].item(), batch_size)
                 for meter, acc in zip(per_head_top5_verb, verb_accs):
@@ -1137,10 +1159,11 @@ def train_multihead_epoch(
                 for meter, acc in zip(per_head_top5_noun, noun_accs):
                     meter.update(acc[1].item(), batch_size)
 
-                top1_action.update(max([a[0].item() for a in action_accs]), batch_size)
+                if action_count > 0:
+                    top1_action.update(max([a[0].item() for a in action_accs]), action_count)
+                    top5_action.update(max([a[1].item() for a in action_accs]), action_count)
                 top1_verb.update(max([a[0].item() for a in verb_accs]), batch_size)
                 top1_noun.update(max([a[0].item() for a in noun_accs]), batch_size)
-                top5_action.update(max([a[1].item() for a in action_accs]), batch_size)
                 top5_verb.update(max([a[1].item() for a in verb_accs]), batch_size)
                 top5_noun.update(max([a[1].item() for a in noun_accs]), batch_size)
             else:
@@ -1235,14 +1258,17 @@ def validate_multihead(val_loader, encoder, classifiers, args):
 
         batch_size = images.size(0)
         if args.multi_task:
-            action_accs = [accuracy(o["action"], action_target, topk=(1, 5)) for o in outputs]
+            action_acc_stats = [_masked_multitask_accuracy(o["action"], action_target, topk=(1, 5)) for o in outputs]
+            action_accs = [acc for acc, _ in action_acc_stats]
+            action_count = action_acc_stats[0][1] if action_acc_stats else 0
             verb_accs = [accuracy(o["verb"], verb_target, topk=(1, 5)) for o in outputs]
             noun_accs = [accuracy(o["noun"], noun_target, topk=(1, 5)) for o in outputs]
 
-            for meter, acc in zip(per_head_top1_action, action_accs):
-                meter.update(acc[0].item(), batch_size)
-            for meter, acc in zip(per_head_top5_action, action_accs):
-                meter.update(acc[1].item(), batch_size)
+            if action_count > 0:
+                for meter, acc in zip(per_head_top1_action, action_accs):
+                    meter.update(acc[0].item(), action_count)
+                for meter, acc in zip(per_head_top5_action, action_accs):
+                    meter.update(acc[1].item(), action_count)
             for meter, acc in zip(per_head_top1_verb, verb_accs):
                 meter.update(acc[0].item(), batch_size)
             for meter, acc in zip(per_head_top5_verb, verb_accs):
@@ -1252,10 +1278,11 @@ def validate_multihead(val_loader, encoder, classifiers, args):
             for meter, acc in zip(per_head_top5_noun, noun_accs):
                 meter.update(acc[1].item(), batch_size)
 
-            top1_action.update(max([a[0].item() for a in action_accs]), batch_size)
+            if action_count > 0:
+                top1_action.update(max([a[0].item() for a in action_accs]), action_count)
+                top5_action.update(max([a[1].item() for a in action_accs]), action_count)
             top1_verb.update(max([a[0].item() for a in verb_accs]), batch_size)
             top1_noun.update(max([a[0].item() for a in noun_accs]), batch_size)
-            top5_action.update(max([a[1].item() for a in action_accs]), batch_size)
             top5_verb.update(max([a[1].item() for a in verb_accs]), batch_size)
             top5_noun.update(max([a[1].item() for a in noun_accs]), batch_size)
         else:
@@ -1424,21 +1451,21 @@ def validate(val_loader, model, flow_model, args):
                 noun_target = noun_target.cuda(args.gpu, non_blocking=True)
                 action_target = action_target.cuda(args.gpu, non_blocking=True)
 
-                all_outputs.append(output["action"].cpu())
-                all_targets.append(action_target.cpu())
+                action_count = _append_valid_action_batch(all_outputs, all_targets, output["action"], action_target)
                 all_outputs_verb.append(output["verb"].cpu())
                 all_targets_verb.append(verb_target.cpu())
                 all_outputs_noun.append(output["noun"].cpu())
                 all_targets_noun.append(noun_target.cpu())
 
-                acc1_action, acc5_action = accuracy(output["action"], action_target, topk=(1, 5))
+                (acc1_action, acc5_action), _ = _masked_multitask_accuracy(output["action"], action_target, topk=(1, 5))
                 acc1_verb, acc5_verb = accuracy(output["verb"], verb_target, topk=(1, 5))
                 acc1_noun, acc5_noun = accuracy(output["noun"], noun_target, topk=(1, 5))
                 batch_size = action_target.size(0)
-                top1_action.update(acc1_action.item(), batch_size)
+                if action_count > 0:
+                    top1_action.update(acc1_action.item(), action_count)
+                    top5_action.update(acc5_action.item(), action_count)
                 top1_verb.update(acc1_verb.item(), batch_size)
                 top1_noun.update(acc1_noun.item(), batch_size)
-                top5_action.update(acc5_action.item(), batch_size)
                 top5_verb.update(acc5_verb.item(), batch_size)
                 top5_noun.update(acc5_noun.item(), batch_size)
             else:
@@ -1822,7 +1849,7 @@ def main(args):
             transform=val_transform,
             is_training=False,
             label_maps=label_maps,
-            filter_actions=True,
+            filter_actions=False,
             clip_length=args.clip_length,
             clip_stride=args.clip_stride,
             sparse_sample=args.sparse_sample,
