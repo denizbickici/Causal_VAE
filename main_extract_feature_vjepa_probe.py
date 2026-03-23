@@ -473,6 +473,63 @@ class EK100MultiTaskDataset(VideoCaptionDatasetBase):
 		return frames, verb_label, noun_label, action_label, self.sample_meta[i]
 
 
+class EK100ExtractDataset(VideoCaptionDatasetBase):
+	"""Single-task EK100 extractor dataset that carries stable sample ids."""
+
+	def __init__(
+		self,
+		args,
+		root: str,
+		metadata: str,
+		transform,
+		is_training: bool,
+		label_mapping,
+		clip_length: int = 32,
+		clip_stride: int = 2,
+		sparse_sample: bool = False,
+	):
+		super().__init__(args, "ek100_cls", root, metadata)
+		self.transform = transform
+		self.is_training = is_training
+		self.label_mapping = label_mapping
+		self.clip_length = clip_length
+		self.clip_stride = clip_stride
+		self.sparse_sample = sparse_sample
+		self.sample_meta = []
+		with open(metadata, newline='') as handle:
+			reader = csv.DictReader(handle)
+			for row_index, row in enumerate(reader):
+				self.sample_meta.append({
+					'narration_id': row.get('narration_id', ''),
+					'narration_row_index': row_index,
+					'video_id': row.get('video_id', ''),
+				})
+		if len(self.sample_meta) != len(self.samples):
+			raise RuntimeError(
+				f"Metadata/sample length mismatch: metadata={len(self.sample_meta)} samples={len(self.samples)}"
+			)
+
+	def __getitem__(self, i):
+		vid_path, start_frame, end_frame, _, verb, noun = self.samples[i]
+		frame_ids = get_frame_ids(start_frame, end_frame, num_segments=self.clip_length, jitter=self.is_training)
+		frames = video_loader_by_frames(self.root, vid_path, frame_ids)
+
+		if self.transform is not None:
+			frames = self.transform(frames)
+
+		if self.args.task_type == 'verb':
+			label = str(verb)
+		elif self.args.task_type == 'noun':
+			label = str(noun)
+		else:
+			label = f'{verb}:{noun}'
+
+		if self.label_mapping is not None:
+			label = self.label_mapping[label]
+
+		return frames, label, self.sample_meta[i]
+
+
 def build_transforms(args):
 	default_crop_size = 224
 	crop_size = VJEPA2_MODEL_SPECS.get(args.model_type, {}).get('crop_size', default_crop_size)
@@ -601,9 +658,9 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 	all_outputs, all_targets, all_feats, all_cls_feats = [], [], [], []
 	all_temporal_probe_feats = [] if args.multi_task else None
 	all_verb_input_feats = [] if args.model_type in VJEPA2_MODEL_SPECS else None
-	all_narration_ids = [] if args.multi_task else None
-	all_narration_row_index = [] if args.multi_task else None
-	all_video_ids = [] if args.multi_task else None
+	all_narration_ids = []
+	all_narration_row_index = []
+	all_video_ids = []
 	end = time.time()
 
 	with torch.no_grad():
@@ -660,7 +717,17 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 						all_narration_row_index.append(torch.as_tensor(row_index_value))
 					all_video_ids.extend(list(sample_meta["video_id"]))
 				else:
-					images, target = batch_data
+					if len(batch_data) == 3:
+						images, target, sample_meta = batch_data
+						all_narration_ids.extend(list(sample_meta["narration_id"]))
+						row_index_value = sample_meta["narration_row_index"]
+						if torch.is_tensor(row_index_value):
+							all_narration_row_index.append(row_index_value.detach().cpu())
+						else:
+							all_narration_row_index.append(torch.as_tensor(row_index_value))
+						all_video_ids.extend(list(sample_meta["video_id"]))
+					else:
+						images, target = batch_data
 				target_gpu = target.cuda(args.gpu, non_blocking=True)
 				if isinstance(images, list):
 					logits_crops, feats_crops, cls_crops = [], [], []
@@ -728,9 +795,10 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 	all_cls_feats = torch.cat(all_cls_feats)
 	all_outputs = torch.cat(all_outputs)
 	all_targets = torch.cat(all_targets)
+	if len(all_narration_row_index) > 0:
+		all_narration_row_index = torch.cat([value.view(-1) for value in all_narration_row_index], dim=0)
 	if args.multi_task:
 		all_temporal_probe_feats = torch.cat(all_temporal_probe_feats)
-		all_narration_row_index = torch.cat([value.view(-1) for value in all_narration_row_index], dim=0)
 	if all_verb_input_feats is not None:
 		if len(all_verb_input_feats) > 0:
 			all_verb_input_feats = torch.cat(all_verb_input_feats)
@@ -748,11 +816,12 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 		'outputs': all_outputs,
 		'targets': all_targets,
 	}
-	if args.multi_task:
-		save_payload['temporal_probe_feats'] = all_temporal_probe_feats
+	if len(all_narration_ids) > 0:
 		save_payload['narration_ids'] = all_narration_ids
 		save_payload['narration_row_index'] = all_narration_row_index
 		save_payload['video_ids'] = all_video_ids
+	if args.multi_task:
+		save_payload['temporal_probe_feats'] = all_temporal_probe_feats
 	if all_verb_input_feats is not None:
 		save_payload['verb_input_feats'] = all_verb_input_feats
 	torch.save(save_payload, save_path)
@@ -986,9 +1055,22 @@ def main(args):
 			train_transform, tokenizer, args, subset='train', label_mapping=mapping_vn2act,
 		)
 	else:
-		train_dataset = datasets.get_downstream_dataset_extract(
-			train_transform, tokenizer, args, subset='train', label_mapping=mapping_vn2act,
-		)
+		if args.dataset == 'ek100_cls':
+			train_dataset = EK100ExtractDataset(
+				args,
+				args.root,
+				args.metadata_train,
+				transform=train_transform,
+				is_training=True,
+				label_mapping=mapping_vn2act,
+				clip_length=args.clip_length,
+				clip_stride=args.clip_stride,
+				sparse_sample=args.sparse_sample,
+			)
+		else:
+			train_dataset = datasets.get_downstream_dataset_extract(
+				train_transform, tokenizer, args, subset='train', label_mapping=mapping_vn2act,
+			)
 	args.num_clips = num_clips_at_val
 	args.num_crops = 1
 	if args.multi_task:
@@ -1009,16 +1091,28 @@ def main(args):
 			val_transform, tokenizer, args, subset='val', label_mapping=mapping_vn2act,
 		)
 	else:
-		val_dataset = datasets.get_downstream_dataset_extract(
-			val_transform, tokenizer, args, subset='val', label_mapping=mapping_vn2act,
-		)
+		if args.dataset == 'ek100_cls':
+			val_dataset = EK100ExtractDataset(
+				args,
+				args.root,
+				args.metadata_val,
+				transform=val_transform,
+				is_training=False,
+				label_mapping=mapping_vn2act,
+				clip_length=args.clip_length,
+				clip_stride=args.clip_stride,
+				sparse_sample=args.sparse_sample,
+			)
+		else:
+			val_dataset = datasets.get_downstream_dataset_extract(
+				val_transform, tokenizer, args, subset='val', label_mapping=mapping_vn2act,
+			)
 
-	if args.distributed:
-		train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-		val_sampler = torch.utils.data.SequentialSampler(val_dataset)
-	else:
-		train_sampler = None
-		val_sampler = None
+	if args.distributed and dist_utils.get_world_size() > 1:
+		raise RuntimeError('Feature extraction must run with a single process to preserve sample order.')
+
+	train_sampler = torch.utils.data.SequentialSampler(train_dataset)
+	val_sampler = torch.utils.data.SequentialSampler(val_dataset)
 
 	train_loader = torch.utils.data.DataLoader(
 		train_dataset, batch_size=args.batch_size, shuffle=False,

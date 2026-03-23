@@ -92,6 +92,75 @@ class MViT_Spatial(nn.Module):
 		# shape: [batch_size, channels, num_frames, height, width]
 		return self.mvit(x)
 
+
+class EK100ExtractDataset(datasets.VideoClassyDataset):
+	"""EK100 extractor dataset that preserves stable sample ids in the export."""
+
+	def __init__(
+		self,
+		root,
+		metadata,
+		transform,
+		is_training,
+		label_mapping,
+		num_clips,
+		clip_length,
+		clip_stride,
+		sparse_sample,
+		args,
+	):
+		super().__init__(
+			args.dataset,
+			root,
+			metadata,
+			transform=transform,
+			is_training=is_training,
+			label_mapping=label_mapping,
+			num_clips=num_clips,
+			clip_length=clip_length,
+			clip_stride=clip_stride,
+			sparse_sample=sparse_sample,
+			is_trimmed=not args.dataset == 'charades_ego',
+			args=args,
+		)
+		self.sample_meta = []
+		with open(metadata, newline='') as handle:
+			reader = csv.DictReader(handle)
+			for row_index, row in enumerate(reader):
+				self.sample_meta.append({
+					'narration_id': row.get('narration_id', ''),
+					'narration_row_index': row_index,
+					'video_id': row.get('video_id', ''),
+				})
+		if len(self.sample_meta) != len(self.samples):
+			raise RuntimeError(
+				f"Metadata/sample length mismatch: metadata={len(self.sample_meta)} samples={len(self.samples)}"
+			)
+
+	def __getitem__(self, i):
+		frames, label = self.get_raw_item(
+			i,
+			is_training=self.is_training,
+			num_clips=self.num_clips,
+			clip_length=self.clip_length,
+			clip_stride=self.clip_stride,
+			sparse_sample=self.sparse_sample,
+		)
+
+		if self.transform is not None:
+			frames = self.transform(frames)
+
+		if self.label_mapping is not None:
+			if isinstance(label, list):
+				res_array = np.zeros(len(self.label_mapping))
+				for lbl in label:
+					res_array[self.label_mapping[lbl]] = 1.
+				label = res_array
+			else:
+				label = self.label_mapping[label]
+
+		return frames, label, self.sample_meta[i]
+
 def get_args_parser():
 	parser = argparse.ArgumentParser(description='lavila finetune and evaluation', add_help=False)
 	# Data
@@ -417,26 +486,52 @@ def main(args):
 	args.num_clips = 1
 	args.num_crops = 3
 	print('=> build dataset')
-	train_dataset = datasets.get_downstream_dataset_extract(
-		train_transform, tokenizer, args, subset='train', label_mapping=mapping_vn2act,
-	)
+	if args.dataset == 'ek100_cls':
+		train_dataset = EK100ExtractDataset(
+			args.root,
+			args.metadata_train,
+			transform=train_transform,
+			is_training=True,
+			label_mapping=mapping_vn2act,
+			num_clips=args.num_clips,
+			clip_length=args.clip_length,
+			clip_stride=args.clip_stride,
+			sparse_sample=args.sparse_sample,
+			args=args,
+		)
+	else:
+		train_dataset = datasets.get_downstream_dataset_extract(
+			train_transform, tokenizer, args, subset='train', label_mapping=mapping_vn2act,
+		)
 	args.num_clips = num_clips_at_val
 	args.num_crops = 1  # Changed from 3 to 1 to match training
-	val_dataset = datasets.get_downstream_dataset_extract(
-		val_transform, tokenizer, args, subset='val', label_mapping=mapping_vn2act,
-	)
+	if args.dataset == 'ek100_cls':
+		val_dataset = EK100ExtractDataset(
+			args.root,
+			args.metadata_val,
+			transform=val_transform,
+			is_training=False,
+			label_mapping=mapping_vn2act,
+			num_clips=args.num_clips,
+			clip_length=args.clip_length,
+			clip_stride=args.clip_stride,
+			sparse_sample=args.sparse_sample,
+			args=args,
+		)
+	else:
+		val_dataset = datasets.get_downstream_dataset_extract(
+			val_transform, tokenizer, args, subset='val', label_mapping=mapping_vn2act,
+		)
 	print('=> build dataset done')
 
-	if args.distributed:
-		train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-		val_sampler = torch.utils.data.SequentialSampler(val_dataset)  # disable distributed
-	else:
-		train_sampler = None
-		val_sampler = None
+	if args.distributed and dist_utils.get_world_size() > 1:
+		raise RuntimeError('Feature extraction must run with a single process to preserve sample order.')
+
+	train_sampler = torch.utils.data.SequentialSampler(train_dataset)
+	val_sampler = torch.utils.data.SequentialSampler(val_dataset)
 
 	train_loader = torch.utils.data.DataLoader(
 		train_dataset, batch_size=args.batch_size, shuffle=False,
-		#num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True
 		num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=False
 	)
 	print('len(train_loader) = {}'.format(len(train_loader)))
@@ -466,10 +561,6 @@ def main(args):
 	print("=> beginning training")
 	epoch = 0  # Set epoch to 0 for feature extraction
 
-	#for epoch in range(args.start_epoch, args.epochs):
-	if args.distributed:
-		train_sampler.set_epoch(epoch)
-
 	train_extract(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule, args)
 	validate_extract(val_loader, model, args)
 
@@ -490,8 +581,8 @@ def train_extract(train_loader, model, criterion, optimizer, scaler, epoch, lr_s
 		[batch_time, data_time, mem, losses, top1, top5, top1_noun, top1_verb],
 		prefix="Epoch: [{}]".format(epoch))
 
-	# switch to train mode
-	model.train()
+	# Feature extraction should preserve inference behavior.
+	model.eval()
 	if args.model_type == 'mvit':
 		activation = {}
 		def getActivation(name):
@@ -514,8 +605,22 @@ def train_extract(train_loader, model, criterion, optimizer, scaler, epoch, lr_s
 	total_cls_feat = []
 	total_target = []
 	total_output = []
+	all_narration_ids = []
+	all_narration_row_index = []
+	all_video_ids = []
 	with torch.no_grad():
-		for data_iter, (images, target) in enumerate(train_loader):
+		for data_iter, batch_data in enumerate(train_loader):
+			if len(batch_data) == 3:
+				images, target, sample_meta = batch_data
+				all_narration_ids.extend(list(sample_meta['narration_id']))
+				row_index_value = sample_meta['narration_row_index']
+				if torch.is_tensor(row_index_value):
+					all_narration_row_index.append(row_index_value.detach().cpu())
+				else:
+					all_narration_row_index.append(torch.as_tensor(row_index_value))
+				all_video_ids.extend(list(sample_meta['video_id']))
+			else:
+				images, target = batch_data
 			#print(type(images), images.shape)
 			if isinstance(images, list):
 				with amp.autocast(enabled=not args.disable_amp):
@@ -590,20 +695,21 @@ def train_extract(train_loader, model, criterion, optimizer, scaler, epoch, lr_s
 	print('total_output', total_output.shape)
 	total_target = torch.cat(total_target)
 	print('total_target', total_target.shape)
+	save_payload = {
+		'feats': total_feat,
+		'cls_feats': torch.cat(total_cls_feat),
+		'outputs': total_output,
+		'targets': total_target,
+	}
+	if len(all_narration_ids) > 0:
+		save_payload['narration_ids'] = all_narration_ids
+		save_payload['narration_row_index'] = torch.cat([value.view(-1) for value in all_narration_row_index], dim=0)
+		save_payload['video_ids'] = all_video_ids
+	save_path = os.path.join(args.output_dir, f'{args.dataset}_train_feat.pt')
 	if args.model_type == 'mvit':
-		total_cls_feat = torch.cat(total_cls_feat)
-		torch.save({'feats': total_feat,
-					'cls_feats': total_cls_feat,
-					'outputs': total_output,
-					'targets': total_target,				
-					},'egtea_train_feat.pt')
+		torch.save(save_payload, save_path)
 	if args.model_type == 'lavila':
-		total_cls_feat = torch.cat(total_cls_feat)
-		torch.save({'feats': total_feat,
-					'cls_feats': total_cls_feat,
-					'outputs': total_output,
-					'targets': total_target,				
-					},'egtea_train_feat.pt')
+		torch.save(save_payload, save_path)
 
 def validate_extract(val_loader, model, args):
 	batch_time = AverageMeter('Time', ':6.2f')
@@ -640,10 +746,24 @@ def validate_extract(val_loader, model, args):
 	all_targets = []
 	all_feats = []
 	all_cls_feats = []
+	all_narration_ids = []
+	all_narration_row_index = []
+	all_video_ids = []
 	
 	with torch.no_grad():
 		end = time.time()
-		for i, (images, target) in enumerate(val_loader):
+		for i, batch_data in enumerate(val_loader):
+			if len(batch_data) == 3:
+				images, target, sample_meta = batch_data
+				all_narration_ids.extend(list(sample_meta['narration_id']))
+				row_index_value = sample_meta['narration_row_index']
+				if torch.is_tensor(row_index_value):
+					all_narration_row_index.append(row_index_value.detach().cpu())
+				else:
+					all_narration_row_index.append(torch.as_tensor(row_index_value))
+				all_video_ids.extend(list(sample_meta['video_id']))
+			else:
+				images, target = batch_data
 			# measure data loading time
 			#print(target)
 			#print(type(images), len(images), images[0].shape)
@@ -715,20 +835,22 @@ def validate_extract(val_loader, model, args):
 	all_targets = torch.cat(all_targets)
 	all_outputs = torch.cat(all_outputs)
 	all_cls_feats = torch.cat(all_cls_feats)
+	save_payload = {
+		'feats': all_feats.detach().cpu(),
+		'cls_feats': all_cls_feats.detach().cpu(),
+		'outputs': all_outputs.detach().cpu(),
+		'targets': all_targets.detach().cpu(),
+	}
+	if len(all_narration_ids) > 0:
+		save_payload['narration_ids'] = all_narration_ids
+		save_payload['narration_row_index'] = torch.cat([value.view(-1) for value in all_narration_row_index], dim=0)
+		save_payload['video_ids'] = all_video_ids
+	save_path = os.path.join(args.output_dir, f'{args.dataset}_test_feat.pt')
 
 	if args.model_type == 'mvit':
-		
-		torch.save({'feats': all_feats.detach().cpu(),
-					'cls_feats': all_cls_feats.detach().cpu(),
-					'outputs': all_outputs.detach().cpu(),
-					'targets': all_targets.detach().cpu(),				
-					},'egtea_test_feat.pt')
+		torch.save(save_payload, save_path)
 	if args.model_type == 'lavila':
-		torch.save({'feats': all_feats.detach().cpu(),
-					'cls_feats': all_cls_feats.detach().cpu(),
-					'outputs': all_outputs.detach().cpu(),
-					'targets': all_targets.detach().cpu(),				
-					},'egtea_test_feat.pt')
+		torch.save(save_payload, save_path)
 
 
 
