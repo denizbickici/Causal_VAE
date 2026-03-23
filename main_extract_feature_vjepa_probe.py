@@ -466,8 +466,9 @@ class EK100MultiTaskDataset(VideoCaptionDatasetBase):
 		verb_key = str(verb)
 		noun_key = str(noun)
 		action_key = f"{verb_key}:{noun_key}"
-		verb_label = self.label_maps["verb"][verb_key]
-		noun_label = self.label_maps["noun"][noun_key]
+		# Keep raw EK100 verb/noun ids so extraction works on the full validation set.
+		verb_label = int(verb_key)
+		noun_label = int(noun_key)
 		action_label = self.label_maps["action"].get(action_key, -1)
 		return frames, verb_label, noun_label, action_label, self.sample_meta[i]
 
