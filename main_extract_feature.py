@@ -584,6 +584,7 @@ def train_extract(train_loader, model, criterion, optimizer, scaler, epoch, lr_s
 
 	# Feature extraction should preserve inference behavior.
 	model.eval()
+	hook_model = model.module if hasattr(model, 'module') else model
 	if args.model_type == 'mvit':
 		activation = {}
 		def getActivation(name):
@@ -591,7 +592,7 @@ def train_extract(train_loader, model, criterion, optimizer, scaler, epoch, lr_s
 			def hook(model, input, output):
 				activation[name] = output.detach()
 			return hook
-		h1 = model.mvit.blocks[-1].mlp.register_forward_hook(getActivation('mlp'))
+		h1 = hook_model.mvit.blocks[-1].mlp.register_forward_hook(getActivation('mlp'))
 	else:
 		activation = {}
 		def getActivation(name):
@@ -599,7 +600,7 @@ def train_extract(train_loader, model, criterion, optimizer, scaler, epoch, lr_s
 			def hook(model, input, output):
 				activation[name] = output.detach()
 			return hook
-		h1 = model.visual.blocks[-1].norm3.register_forward_hook(getActivation('norm3'))
+		h1 = hook_model.visual.blocks[-1].norm3.register_forward_hook(getActivation('norm3'))
 
 	end = time.time()
 	total_feat = []
@@ -721,6 +722,7 @@ def validate_extract(val_loader, model, args):
 		prefix='Test: '
 	)
 	
+	hook_model = model.module if hasattr(model, 'module') else model
 	if args.model_type == 'mvit':
 		activation = {}
 		def getActivation(name):
@@ -728,7 +730,7 @@ def validate_extract(val_loader, model, args):
 			def hook(model, input, output):
 				activation[name] = output.detach()
 			return hook
-		h1 = model.mvit.blocks[-1].mlp.register_forward_hook(getActivation('mlp'))
+		h1 = hook_model.mvit.blocks[-1].mlp.register_forward_hook(getActivation('mlp'))
 	else:
 		activation = {}
 		def getActivation(name):
@@ -736,7 +738,7 @@ def validate_extract(val_loader, model, args):
 			def hook(model, input, output):
 				activation[name] = output.detach()
 			return hook
-		h1 = model.visual.blocks[-1].norm3.register_forward_hook(getActivation('norm3'))
+		h1 = hook_model.visual.blocks[-1].norm3.register_forward_hook(getActivation('norm3'))
 
 	# switch to eval mode
 	model.eval()
