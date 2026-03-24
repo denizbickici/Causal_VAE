@@ -76,6 +76,21 @@ def load_checkpoint(checkpoint_path):
 		print(f"Loading PyTorch checkpoint: {checkpoint_path}")
 		return torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
+
+def load_state_dict_flexible(model, checkpoint_state_dict, strict=False):
+	"""Load checkpoints regardless of DDP wrapping or module-prefix convention."""
+	target_model = model.module if hasattr(model, 'module') else model
+	target_state = target_model.state_dict()
+	normalized_state = OrderedDict()
+
+	for key, value in checkpoint_state_dict.items():
+		normalized_key = key[7:] if key.startswith('module.') else key
+		if normalized_key in target_state:
+			normalized_state[normalized_key] = value
+
+	result = target_model.load_state_dict(normalized_state, strict=strict)
+	return result
+
 class MViT_Spatial(nn.Module):
 	def __init__(self, num_classes, dropout=0.1):
 		super().__init__()
@@ -364,22 +379,13 @@ def main(args):
 										  eps=args.eps, weight_decay=args.wd)
 	scaler = amp.GradScaler(enabled=not args.disable_amp)
 	# optionally resume from a checkpoint (takes precedence over autoresume)
-	latest = os.path.join(args.output_dir, 'checkpoint.pt')
-	if os.path.isfile(latest):
-		args.resume = ''
 	if args.resume:
 		if os.path.isfile(args.resume):
 			print("=> loading resume checkpoint '{}'".format(args.resume))
 			checkpoint = load_checkpoint(args.resume)
 			epoch = checkpoint['epoch'] if 'epoch' in checkpoint else 0
 			args.start_epoch = epoch
-			if not args.distributed:
-				state_dict = OrderedDict()
-				for k, v in checkpoint['state_dict'].items():
-					state_dict[k.replace('module.', '')] = v
-				result = model.load_state_dict(state_dict, strict=False)
-			else:
-				result = model.load_state_dict(checkpoint['state_dict'], strict=False)
+			result = load_state_dict_flexible(model, checkpoint['state_dict'], strict=False)
 			print(result)
 			#print(checkpoint['optimizer'])
 			#optimizer.load_state_dict(checkpoint['optimizer']) if 'optimizer' in checkpoint else ()
@@ -396,7 +402,8 @@ def main(args):
 			print("=> loading latest checkpoint '{}'".format(latest))
 			latest_checkpoint = load_checkpoint(latest)
 			args.start_epoch = latest_checkpoint.get('epoch', 0)
-			model.load_state_dict(latest_checkpoint['state_dict'])
+			result = load_state_dict_flexible(model, latest_checkpoint['state_dict'], strict=False)
+			print(result)
 			if 'optimizer' in latest_checkpoint:
 				optimizer.load_state_dict(latest_checkpoint['optimizer'])
 			if 'scaler' in latest_checkpoint:
