@@ -10,17 +10,39 @@ import csv
 from lavila.models.tokenizer import MyBertTokenizer, MyDistilBertTokenizer, MyGPT2Tokenizer, SimpleTokenizer
 
 
-def generate_label_map(dataset, args):
+def _get_arg(args, *names, default=None):
+    if args is None:
+        return default
+    for name in names:
+        if hasattr(args, name):
+            value = getattr(args, name)
+            if value not in (None, ''):
+                return value
+    return default
+
+
+def generate_label_map(dataset, args=None):
     if dataset == 'ek100_cls':
-        finetune_type = getattr(args, 'egtea_finetune_type', 'action')  # Use same arg name for consistency
-        train_csv = getattr(
-            args, 'ek100_train_csv',
-            '/home/dz/Projects/multi-modal_AR/data/EK/data/EPIC_100_train.csv'
+        finetune_type = _get_arg(args, 'egtea_finetune_type', default='action')
+        train_csv = _get_arg(
+            args,
+            'metadata_train',
+            'ek100_train_csv',
+            default='/home/dz/Projects/multi-modal_AR/data/EK/data/EPIC_100_train.csv',
         )
-        val_csv = getattr(
-            args, 'ek100_val_csv',
-            '/home/dz/Projects/multi-modal_AR/data/EK/data/EPIC_100_validation.csv'
+        val_csv = _get_arg(
+            args,
+            'metadata_val',
+            'ek100_val_csv',
+            default='/home/dz/Projects/multi-modal_AR/data/EK/data/EPIC_100_validation.csv',
         )
+
+        for csv_path in [train_csv, val_csv]:
+            if not os.path.isfile(csv_path):
+                raise FileNotFoundError(
+                    f"EK100 metadata CSV not found: {csv_path}. "
+                    "Pass --metadata-train/--metadata-val to the caller."
+                )
         
         if finetune_type == 'verb':
             print("Preprocess ek100 verb label space")
