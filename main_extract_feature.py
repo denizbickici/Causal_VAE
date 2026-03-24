@@ -76,21 +76,6 @@ def load_checkpoint(checkpoint_path):
 		print(f"Loading PyTorch checkpoint: {checkpoint_path}")
 		return torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
-
-def load_state_dict_flexible(model, checkpoint_state_dict, strict=False):
-	"""Load checkpoints regardless of DDP wrapping or module-prefix convention."""
-	target_model = model.module if hasattr(model, 'module') else model
-	target_state = target_model.state_dict()
-	normalized_state = OrderedDict()
-
-	for key, value in checkpoint_state_dict.items():
-		normalized_key = key[7:] if key.startswith('module.') else key
-		if normalized_key in target_state:
-			normalized_state[normalized_key] = value
-
-	result = target_model.load_state_dict(normalized_state, strict=strict)
-	return result
-
 class MViT_Spatial(nn.Module):
 	def __init__(self, num_classes, dropout=0.1):
 		super().__init__()
@@ -109,36 +94,11 @@ class MViT_Spatial(nn.Module):
 		return self.mvit(x)
 
 
-class EK100ExtractDataset(datasets.VideoClassyDataset):
-	"""EK100 extractor dataset that preserves stable sample ids in the export."""
+class DatasetWithSampleMeta(torch.utils.data.Dataset):
+	"""Attach stable sample ids without changing the underlying dataset behavior."""
 
-	def __init__(
-		self,
-		root,
-		metadata,
-		transform,
-		is_training,
-		label_mapping,
-		num_clips,
-		clip_length,
-		clip_stride,
-		sparse_sample,
-		args,
-	):
-		super().__init__(
-			args.dataset,
-			root,
-			metadata,
-			transform=transform,
-			is_training=is_training,
-			label_mapping=label_mapping,
-			num_clips=num_clips,
-			clip_length=clip_length,
-			clip_stride=clip_stride,
-			sparse_sample=sparse_sample,
-			is_trimmed=not args.dataset == 'charades_ego',
-			args=args,
-		)
+	def __init__(self, dataset, metadata):
+		self.dataset = dataset
 		self.sample_meta = []
 		with open(metadata, newline='') as handle:
 			reader = csv.DictReader(handle)
@@ -148,34 +108,17 @@ class EK100ExtractDataset(datasets.VideoClassyDataset):
 					'narration_row_index': row_index,
 					'video_id': row.get('video_id', ''),
 				})
-		if len(self.sample_meta) != len(self.samples):
+		if len(self.sample_meta) != len(self.dataset):
 			raise RuntimeError(
-				f"Metadata/sample length mismatch: metadata={len(self.sample_meta)} samples={len(self.samples)}"
+				f"Metadata/sample length mismatch: metadata={len(self.sample_meta)} samples={len(self.dataset)}"
 			)
 
-	def __getitem__(self, i):
-		frames, label = self.get_raw_item(
-			i,
-			is_training=self.is_training,
-			num_clips=self.num_clips,
-			clip_length=self.clip_length,
-			clip_stride=self.clip_stride,
-			sparse_sample=self.sparse_sample,
-		)
+	def __len__(self):
+		return len(self.dataset)
 
-		if self.transform is not None:
-			frames = self.transform(frames)
-
-		if self.label_mapping is not None:
-			if isinstance(label, list):
-				res_array = np.zeros(len(self.label_mapping))
-				for lbl in label:
-					res_array[self.label_mapping[lbl]] = 1.
-				label = res_array
-			else:
-				label = self.label_mapping[label]
-
-		return frames, label, self.sample_meta[i]
+	def __getitem__(self, index):
+		frames, label = self.dataset[index]
+		return frames, label, self.sample_meta[index]
 
 def get_args_parser():
 	parser = argparse.ArgumentParser(description='lavila finetune and evaluation', add_help=False)
@@ -379,13 +322,22 @@ def main(args):
 										  eps=args.eps, weight_decay=args.wd)
 	scaler = amp.GradScaler(enabled=not args.disable_amp)
 	# optionally resume from a checkpoint (takes precedence over autoresume)
+	latest = os.path.join(args.output_dir, 'checkpoint.pt')
+	if os.path.isfile(latest):
+		args.resume = ''
 	if args.resume:
 		if os.path.isfile(args.resume):
 			print("=> loading resume checkpoint '{}'".format(args.resume))
 			checkpoint = load_checkpoint(args.resume)
 			epoch = checkpoint['epoch'] if 'epoch' in checkpoint else 0
 			args.start_epoch = epoch
-			result = load_state_dict_flexible(model, checkpoint['state_dict'], strict=False)
+			if not args.distributed:
+				state_dict = OrderedDict()
+				for k, v in checkpoint['state_dict'].items():
+					state_dict[k.replace('module.', '')] = v
+				result = model.load_state_dict(state_dict, strict=False)
+			else:
+				result = model.load_state_dict(checkpoint['state_dict'], strict=False)
 			print(result)
 			#print(checkpoint['optimizer'])
 			#optimizer.load_state_dict(checkpoint['optimizer']) if 'optimizer' in checkpoint else ()
@@ -402,8 +354,7 @@ def main(args):
 			print("=> loading latest checkpoint '{}'".format(latest))
 			latest_checkpoint = load_checkpoint(latest)
 			args.start_epoch = latest_checkpoint.get('epoch', 0)
-			result = load_state_dict_flexible(model, latest_checkpoint['state_dict'], strict=False)
-			print(result)
+			model.load_state_dict(latest_checkpoint['state_dict'])
 			if 'optimizer' in latest_checkpoint:
 				optimizer.load_state_dict(latest_checkpoint['optimizer'])
 			if 'scaler' in latest_checkpoint:
@@ -494,49 +445,25 @@ def main(args):
 	args.num_clips = 1
 	args.num_crops = 3
 	print('=> build dataset')
-	if args.dataset == 'ek100_cls':
-		train_dataset = EK100ExtractDataset(
-			args.root,
-			args.metadata_train,
-			transform=train_transform,
-			is_training=True,
-			label_mapping=mapping_vn2act,
-			num_clips=args.num_clips,
-			clip_length=args.clip_length,
-			clip_stride=args.clip_stride,
-			sparse_sample=args.sparse_sample,
-			args=args,
-		)
-	else:
-		train_dataset = datasets.get_downstream_dataset_extract(
-			train_transform, tokenizer, args, subset='train', label_mapping=mapping_vn2act,
-		)
+	train_dataset = datasets.get_downstream_dataset_extract(
+		train_transform, tokenizer, args, subset='train', label_mapping=mapping_vn2act,
+	)
 	args.num_clips = num_clips_at_val
 	args.num_crops = 1  # Changed from 3 to 1 to match training
+	val_dataset = datasets.get_downstream_dataset_extract(
+		val_transform, tokenizer, args, subset='val', label_mapping=mapping_vn2act,
+	)
 	if args.dataset == 'ek100_cls':
-		val_dataset = EK100ExtractDataset(
-			args.root,
-			args.metadata_val,
-			transform=val_transform,
-			is_training=False,
-			label_mapping=mapping_vn2act,
-			num_clips=args.num_clips,
-			clip_length=args.clip_length,
-			clip_stride=args.clip_stride,
-			sparse_sample=args.sparse_sample,
-			args=args,
-		)
-	else:
-		val_dataset = datasets.get_downstream_dataset_extract(
-			val_transform, tokenizer, args, subset='val', label_mapping=mapping_vn2act,
-		)
+		train_dataset = DatasetWithSampleMeta(train_dataset, args.metadata_train)
+		val_dataset = DatasetWithSampleMeta(val_dataset, args.metadata_val)
 	print('=> build dataset done')
 
-	if args.distributed and dist_utils.get_world_size() > 1:
-		raise RuntimeError('Feature extraction must run with a single process to preserve sample order.')
-
-	train_sampler = torch.utils.data.SequentialSampler(train_dataset)
-	val_sampler = torch.utils.data.SequentialSampler(val_dataset)
+	if args.distributed:
+		train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+		val_sampler = torch.utils.data.SequentialSampler(val_dataset)  # disable distributed
+	else:
+		train_sampler = None
+		val_sampler = None
 
 	train_loader = torch.utils.data.DataLoader(
 		train_dataset, batch_size=args.batch_size, shuffle=False,
@@ -569,6 +496,9 @@ def main(args):
 	print("=> beginning training")
 	epoch = 0  # Set epoch to 0 for feature extraction
 
+	if args.distributed:
+		train_sampler.set_epoch(epoch)
+
 	train_extract(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule, args)
 	validate_extract(val_loader, model, args)
 
@@ -589,8 +519,8 @@ def train_extract(train_loader, model, criterion, optimizer, scaler, epoch, lr_s
 		[batch_time, data_time, mem, losses, top1, top5, top1_noun, top1_verb],
 		prefix="Epoch: [{}]".format(epoch))
 
-	# Feature extraction should preserve inference behavior.
-	model.eval()
+	# switch to train mode
+	model.train()
 	hook_model = model.module if hasattr(model, 'module') else model
 	if args.model_type == 'mvit':
 		activation = {}
