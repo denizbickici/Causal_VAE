@@ -78,12 +78,12 @@ def load_checkpoint(checkpoint_path):
 
 
 def split_classifier_outputs(output):
-	"""Normalize single-head vs multi-head classifier outputs."""
+	"""Return the action head for both single-head and multi-head classifiers."""
 	if isinstance(output, list):
 		if len(output) != 3:
 			raise ValueError(f"Expected 3 heads for vn-classifier output, got {len(output)}")
-		return output[2], {'verb_outputs': output[0], 'noun_outputs': output[1]}
-	return output, {}
+		return output[2]
+	return output
 
 class MViT_Spatial(nn.Module):
 	def __init__(self, num_classes, dropout=0.1):
@@ -553,8 +553,6 @@ def train_extract(train_loader, model, criterion, optimizer, scaler, epoch, lr_s
 	total_cls_feat = []
 	total_target = []
 	total_output = []
-	total_verb_output = []
-	total_noun_output = []
 	all_narration_ids = []
 	all_narration_row_index = []
 	all_video_ids = []
@@ -577,20 +575,15 @@ def train_extract(train_loader, model, criterion, optimizer, scaler, epoch, lr_s
 					logit_allcrops = []
 					feat_allcrops = []
 					cls_feat_allcrops = []
-					verb_logit_allcrops = []
-					noun_logit_allcrops = []
 					for crop in images:
 						crop = crop.cuda(args.gpu, non_blocking=True)
 						if args.use_half:
 							crop = crop.half()
 						if args.model_type == 'lavila':
 							logit, cls_feat = model(crop, use_checkpoint=args.use_checkpoint)
-							logit, aux_outputs = split_classifier_outputs(logit)
+							logit = split_classifier_outputs(logit)
 							#feat = activation['norm3'][:,1:,:].view(-1,8,49,768)
 							feat = activation['norm3'][:,1:,:][:, ::256, :]
-							if 'verb_outputs' in aux_outputs:
-								verb_logit_allcrops.append(aux_outputs['verb_outputs'].unsqueeze(1).detach().cpu())
-								noun_logit_allcrops.append(aux_outputs['noun_outputs'].unsqueeze(1).detach().cpu())
 							
 						if args.model_type == 'mvit':
 							logit = model(crop)
@@ -612,9 +605,6 @@ def train_extract(train_loader, model, criterion, optimizer, scaler, epoch, lr_s
 				total_feat.append(feat_allcrops.detach().cpu())
 				total_cls_feat.append(cls_feat_allcrops.detach().cpu())
 				total_output.append(logit_allcrops.detach().cpu())
-				if len(verb_logit_allcrops) > 0:
-					total_verb_output.append(torch.cat(verb_logit_allcrops, 1))
-					total_noun_output.append(torch.cat(noun_logit_allcrops, 1))
 				total_target.append(target.detach().cpu())
 			else:
 				images = images.cuda(args.gpu, non_blocking=True)
@@ -624,12 +614,9 @@ def train_extract(train_loader, model, criterion, optimizer, scaler, epoch, lr_s
 				with amp.autocast(enabled=not args.disable_amp):
 					if args.model_type == 'lavila':
 						output, cls_feat = model(images, use_checkpoint=args.use_checkpoint)
-						output, aux_outputs = split_classifier_outputs(output)
+						output = split_classifier_outputs(output)
 						img_feat = activation['norm3'][:,1:,:][:, ::256, :]
 						total_cls_feat.append(cls_feat.detach().cpu())
-						if 'verb_outputs' in aux_outputs:
-							total_verb_output.append(aux_outputs['verb_outputs'].detach().cpu())
-							total_noun_output.append(aux_outputs['noun_outputs'].detach().cpu())
 
 					if args.model_type == 'mvit':
 						output = model(images)						
@@ -664,9 +651,6 @@ def train_extract(train_loader, model, criterion, optimizer, scaler, epoch, lr_s
 		'outputs': total_output,
 		'targets': total_target,
 	}
-	if len(total_verb_output) > 0:
-		save_payload['verb_outputs'] = torch.cat(total_verb_output)
-		save_payload['noun_outputs'] = torch.cat(total_noun_output)
 	if len(all_narration_ids) > 0:
 		save_payload['narration_ids'] = all_narration_ids
 		save_payload['narration_row_index'] = torch.cat([value.view(-1) for value in all_narration_row_index], dim=0)
@@ -710,8 +694,6 @@ def validate_extract(val_loader, model, args):
 		model.half()
 
 	all_outputs = []
-	all_verb_outputs = []
-	all_noun_outputs = []
 	all_targets = []
 	all_feats = []
 	all_cls_feats = []
@@ -741,8 +723,6 @@ def validate_extract(val_loader, model, args):
 				logit_allcrops = []
 				feat_allcrops = []
 				cls_feat_allcrops = []
-				verb_logit_allcrops = []
-				noun_logit_allcrops = []
 				for crop in images:
 					crop = crop.cuda(args.gpu, non_blocking=True)
 					if args.use_half:
@@ -750,12 +730,9 @@ def validate_extract(val_loader, model, args):
 						
 					if args.model_type == 'lavila':
 						logit, cls_feat = model(crop, use_checkpoint=args.use_checkpoint)
-						logit, aux_outputs = split_classifier_outputs(logit)
+						logit = split_classifier_outputs(logit)
 						feat = activation['norm3'][:,1:,:][:, ::256, :]
 						cls_feat_allcrops.append(cls_feat.unsqueeze(1).detach().cpu())
-						if 'verb_outputs' in aux_outputs:
-							verb_logit_allcrops.append(aux_outputs['verb_outputs'].unsqueeze(1).detach().cpu())
-							noun_logit_allcrops.append(aux_outputs['noun_outputs'].unsqueeze(1).detach().cpu())
 						
 					if args.model_type == 'mvit':
 						logit = model(crop)
@@ -776,9 +753,6 @@ def validate_extract(val_loader, model, args):
 
 				#if args.model_type == 'mvit':
 				cls_feat_allcrops = torch.cat(cls_feat_allcrops, 1)
-				if len(verb_logit_allcrops) > 0:
-					all_verb_outputs.append(torch.cat(verb_logit_allcrops, 1))
-					all_noun_outputs.append(torch.cat(noun_logit_allcrops, 1))
 				#feat = feat_allcrops.mean(0)
 				
 			else:
@@ -788,7 +762,7 @@ def validate_extract(val_loader, model, args):
 					images = images.half()
 
 				logit, feat = model(images, use_checkpoint=args.use_checkpoint)
-				logit, _ = split_classifier_outputs(logit)
+				logit = split_classifier_outputs(logit)
 				logit = torch.softmax(logit, dim=1)
 
 				acc1, acc5 = accuracy(logit, target, topk=(1, 5))
@@ -820,9 +794,6 @@ def validate_extract(val_loader, model, args):
 		'outputs': all_outputs.detach().cpu(),
 		'targets': all_targets.detach().cpu(),
 	}
-	if len(all_verb_outputs) > 0:
-		save_payload['verb_outputs'] = torch.cat(all_verb_outputs).detach().cpu()
-		save_payload['noun_outputs'] = torch.cat(all_noun_outputs).detach().cpu()
 	if len(all_narration_ids) > 0:
 		save_payload['narration_ids'] = all_narration_ids
 		save_payload['narration_row_index'] = torch.cat([value.view(-1) for value in all_narration_row_index], dim=0)
