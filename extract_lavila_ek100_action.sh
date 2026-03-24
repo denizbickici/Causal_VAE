@@ -35,6 +35,7 @@ CLIP_LENGTH="${CLIP_LENGTH:-16}"
 CLIP_STRIDE="${CLIP_STRIDE:-2}"
 NUM_CLIPS="${NUM_CLIPS:-1}"
 NUM_CROPS="${NUM_CROPS:-1}"
+USE_VN_CLASSIFIER="${USE_VN_CLASSIFIER:-1}"
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -54,7 +55,6 @@ CMD=(
     --metadata-val "$VAL_META"
     --root "$ROOT_DIR"
     --pretrain-model "$PRETRAIN_MODEL"
-    --num-classes 3806
     --batch-size "$BATCH_SIZE"
     --use-sgd
     --wd 4e-5
@@ -69,6 +69,12 @@ CMD=(
     --seed "$SEED"
     --use-checkpoint
 )
+
+if [ "$USE_VN_CLASSIFIER" = "1" ]; then
+    CMD+=(--use-vn-classifier --num-classes 97 300 3806)
+else
+    CMD+=(--num-classes 3806)
+fi
 
 if [ $# -gt 0 ]; then
     CMD+=("$@")
