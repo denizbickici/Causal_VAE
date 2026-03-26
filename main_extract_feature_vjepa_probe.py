@@ -8,8 +8,8 @@
 Feature extraction script for MViT and V-JEPA backbones.
 Outputs follow the same format as the original extractor:
   {'feats': ..., 'cls_feats': ..., 'outputs': ..., 'targets': ...}
-Multi-task V-JEPA2 extraction adds:
-  {'temporal_probe_feats': ...}  # head-specific temporal probe features per saved head file
+Attentive V-JEPA2 extraction also adds:
+  {'temporal_probe_feats': ...}  # [B, T, D] for single-task, head-specific for multitask
 Backbone motion extraction adds:
   {'verb_input_feats': ...}
 """
@@ -139,8 +139,8 @@ def load_checkpoint(checkpoint_path: str):
 		return torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
 
-class VJEPA2FeatureExtractor(nn.Module):
-	"""Thin wrapper that exposes logits and token-level features from V-JEPA2."""
+class VJEPA2MeanPoolClassifier(nn.Module):
+	"""Mean-pool classifier on top of a V-JEPA2 encoder."""
 
 	def __init__(self, variant_key: str, num_classes: int, dropout: float = 0.5, pretrained_backbone: bool = True):
 		super().__init__()
@@ -158,6 +158,150 @@ class VJEPA2FeatureExtractor(nn.Module):
 		if return_features:
 			return logits, tokens, pooled
 		return logits
+
+
+class VJEPA2ProbeHead(nn.Module):
+	"""Single-query attentive probe head for verb-only or noun-only extraction."""
+
+	def __init__(
+		self,
+		variant_key: str,
+		embed_dim: int,
+		num_classes: int,
+		num_heads: int,
+		depth: int,
+		mlp_ratio: float = 4.0,
+		dropout: float = 0.0,
+		use_activation_checkpointing: bool = True,
+	):
+		super().__init__()
+		AttentivePooler = _get_vjepa2_attentive_pooler(variant_key)
+		self.pooler = AttentivePooler(
+			num_queries=1,
+			embed_dim=embed_dim,
+			num_heads=num_heads,
+			depth=depth,
+			mlp_ratio=mlp_ratio,
+			use_activation_checkpointing=use_activation_checkpointing,
+		)
+		self.dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
+		self.classifier = nn.Linear(embed_dim, num_classes)
+
+	def forward(self, x, return_features: bool = False):
+		pooled = self.pooler(x).squeeze(1)
+		logits = self.classifier(self.dropout(pooled))
+		if return_features:
+			return logits, pooled
+		return logits
+
+
+class VJEPA2TemporalProbeHead(nn.Module):
+	"""Single-query attentive probe that produces task-conditioned temporal features."""
+
+	def __init__(
+		self,
+		variant_key: str,
+		embed_dim: int,
+		num_classes: int,
+		num_heads: int,
+		depth: int,
+		mlp_ratio: float = 4.0,
+		dropout: float = 0.0,
+		use_activation_checkpointing: bool = True,
+	):
+		super().__init__()
+		AttentivePooler = _get_vjepa2_attentive_pooler(variant_key)
+		self.pooler = AttentivePooler(
+			num_queries=1,
+			embed_dim=embed_dim,
+			num_heads=num_heads,
+			depth=depth,
+			mlp_ratio=mlp_ratio,
+			use_activation_checkpointing=use_activation_checkpointing,
+		)
+		self.dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
+		self.classifier = nn.Linear(embed_dim, num_classes)
+
+	def forward(self, x, temporal_length: int, return_features: bool = False):
+		temporal_feats = _temporal_query_pool(self.pooler, x, temporal_length)[:, :, 0, :]
+		pooled = temporal_feats.mean(dim=1)
+		logits = self.classifier(self.dropout(pooled))
+		if return_features:
+			return logits, temporal_feats, pooled
+		return logits
+
+
+class VJEPA2ProbeClassifier(nn.Module):
+	"""Frozen-style V-JEPA2 encoder with a single attentive probe head."""
+
+	def __init__(
+		self,
+		variant_key: str,
+		num_classes: int,
+		probe_num_heads: int = 16,
+		probe_num_blocks: int = 4,
+		probe_mlp_ratio: float = 4.0,
+		probe_dropout: float = 0.0,
+		use_activation_checkpointing: bool = True,
+		pretrained_backbone: bool = True,
+	):
+		super().__init__()
+		self.encoder = _load_vjepa2_encoder(variant_key, pretrained=pretrained_backbone)
+		self.num_features = self.encoder.embed_dim
+		self.probe = VJEPA2ProbeHead(
+			variant_key=variant_key,
+			embed_dim=self.num_features,
+			num_classes=num_classes,
+			num_heads=probe_num_heads,
+			depth=probe_num_blocks,
+			mlp_ratio=probe_mlp_ratio,
+			dropout=probe_dropout,
+			use_activation_checkpointing=use_activation_checkpointing,
+		)
+
+	def forward(self, x, return_features: bool = False):
+		tokens = self.encoder(x)
+		if return_features:
+			logits, probe_feat = self.probe(tokens, return_features=True)
+			return logits, tokens, probe_feat
+		return self.probe(tokens)
+
+
+class VJEPA2TemporalProbeClassifier(nn.Module):
+	"""V-JEPA2 encoder with a temporal-output attentive probe head."""
+
+	def __init__(
+		self,
+		variant_key: str,
+		num_classes: int,
+		probe_num_heads: int = 16,
+		probe_num_blocks: int = 4,
+		probe_mlp_ratio: float = 4.0,
+		probe_dropout: float = 0.0,
+		use_activation_checkpointing: bool = True,
+		pretrained_backbone: bool = True,
+	):
+		super().__init__()
+		self.encoder = _load_vjepa2_encoder(variant_key, pretrained=pretrained_backbone)
+		self.num_features = self.encoder.embed_dim
+		self.probe = VJEPA2TemporalProbeHead(
+			variant_key=variant_key,
+			embed_dim=self.num_features,
+			num_classes=num_classes,
+			num_heads=probe_num_heads,
+			depth=probe_num_blocks,
+			mlp_ratio=probe_mlp_ratio,
+			dropout=probe_dropout,
+			use_activation_checkpointing=use_activation_checkpointing,
+		)
+
+	def forward(self, x, return_features: bool = False):
+		tokens = self.encoder(x)
+		temporal_length = _get_token_temporal_length(self.encoder, x, x.shape[2] if x.ndim == 5 else 1)
+		if return_features:
+			logits, temporal_feats, pooled = self.probe(tokens, temporal_length, return_features=True)
+			return logits, tokens, pooled, temporal_feats
+		return self.probe(tokens, temporal_length)
 
 
 class VJEPA2MultiTaskProbeHead(nn.Module):
@@ -204,6 +348,56 @@ class VJEPA2MultiTaskProbeHead(nn.Module):
 		return logits
 
 
+class VJEPA2TemporalMultiTaskProbeHead(nn.Module):
+	"""Temporal-output attentive probe head with verb/noun/action classifiers."""
+
+	def __init__(
+		self,
+		variant_key: str,
+		embed_dim: int,
+		num_verb_classes: int,
+		num_noun_classes: int,
+		num_action_classes: int,
+		num_heads: int,
+		depth: int,
+		mlp_ratio: float = 4.0,
+		dropout: float = 0.0,
+		use_activation_checkpointing: bool = True,
+	):
+		super().__init__()
+		AttentivePooler = _get_vjepa2_attentive_pooler(variant_key)
+		self.pooler = AttentivePooler(
+			num_queries=3,
+			embed_dim=embed_dim,
+			num_heads=num_heads,
+			depth=depth,
+			mlp_ratio=mlp_ratio,
+			use_activation_checkpointing=use_activation_checkpointing,
+		)
+		self.dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
+		self.verb_classifier = nn.Linear(embed_dim, num_verb_classes, bias=True)
+		self.noun_classifier = nn.Linear(embed_dim, num_noun_classes, bias=True)
+		self.action_classifier = nn.Linear(embed_dim, num_action_classes, bias=True)
+
+	def forward(self, x, temporal_length: int, return_features: bool = False):
+		temporal_feats = _temporal_query_pool(self.pooler, x, temporal_length)
+		pooled = temporal_feats.mean(dim=1)
+		verb_feat, noun_feat, action_feat = pooled[:, 0, :], pooled[:, 1, :], pooled[:, 2, :]
+		verb_logits = self.verb_classifier(self.dropout(verb_feat))
+		noun_logits = self.noun_classifier(self.dropout(noun_feat))
+		action_logits = self.action_classifier(self.dropout(action_feat))
+		logits = dict(verb=verb_logits, noun=noun_logits, action=action_logits)
+		if return_features:
+			clip_feats = dict(verb=verb_feat, noun=noun_feat, action=action_feat)
+			temporal = dict(
+				verb=temporal_feats[:, :, 0, :],
+				noun=temporal_feats[:, :, 1, :],
+				action=temporal_feats[:, :, 2, :],
+			)
+			return logits, clip_feats, temporal
+		return logits
+
+
 class VJEPA2MultiTaskProbeClassifier(nn.Module):
 	"""V-JEPA2 encoder with multi-task attentive probes."""
 
@@ -242,6 +436,47 @@ class VJEPA2MultiTaskProbeClassifier(nn.Module):
 			logits, probe_feats = self.probe(tokens, return_features=True)
 			return logits, tokens, probe_feats
 		return self.probe(tokens)
+
+
+class VJEPA2TemporalMultiTaskProbeClassifier(nn.Module):
+	"""V-JEPA2 encoder with temporal-output multi-task attentive probes."""
+
+	def __init__(
+		self,
+		variant_key: str,
+		num_verb_classes: int,
+		num_noun_classes: int,
+		num_action_classes: int,
+		probe_num_heads: int = 16,
+		probe_num_blocks: int = 4,
+		probe_mlp_ratio: float = 4.0,
+		probe_dropout: float = 0.0,
+		use_activation_checkpointing: bool = True,
+		pretrained_backbone: bool = True,
+	):
+		super().__init__()
+		self.encoder = _load_vjepa2_encoder(variant_key, pretrained=pretrained_backbone)
+		self.num_features = self.encoder.embed_dim
+		self.probe = VJEPA2TemporalMultiTaskProbeHead(
+			variant_key=variant_key,
+			embed_dim=self.num_features,
+			num_verb_classes=num_verb_classes,
+			num_noun_classes=num_noun_classes,
+			num_action_classes=num_action_classes,
+			num_heads=probe_num_heads,
+			depth=probe_num_blocks,
+			mlp_ratio=probe_mlp_ratio,
+			dropout=probe_dropout,
+			use_activation_checkpointing=use_activation_checkpointing,
+		)
+
+	def forward(self, x, return_features: bool = False):
+		tokens = self.encoder(x)
+		temporal_length = _get_token_temporal_length(self.encoder, x, x.shape[2] if x.ndim == 5 else 1)
+		if return_features:
+			logits, clip_feats, temporal_feats = self.probe(tokens, temporal_length, return_features=True)
+			return logits, tokens, clip_feats, temporal_feats
+		return self.probe(tokens, temporal_length)
 
 
 class MViT_Spatial(nn.Module):
@@ -307,6 +542,12 @@ def reshape_temporal_features(token_feats: torch.Tensor, clip_length: int):
 		return token_feats.view(
 			token_feats.shape[0], clip_length, tokens_per_frame, token_feats.shape[-1]
 		).mean(dim=2)
+	if clip_length > 0 and token_count > 1 and (token_count - 1) % clip_length == 0:
+		patch_tokens = token_feats[:, 1:, :]
+		tokens_per_frame = patch_tokens.shape[1] // clip_length
+		return patch_tokens.view(
+			token_feats.shape[0], clip_length, tokens_per_frame, token_feats.shape[-1]
+		).mean(dim=2)
 	return token_feats
 
 
@@ -340,39 +581,55 @@ def _get_token_temporal_length(encoder: nn.Module, inputs: torch.Tensor, clip_le
 	return max(1, frame_count // tubelet_size)
 
 
-def extract_head_temporal_features(pooler: nn.Module, token_feats: torch.Tensor, clip_length: int):
-	"""
-	Extract head-specific temporal features [B, T, D] by applying the probe's
-	learned query tokens to each frame's spatial tokens.
-	"""
+def _apply_pooler_sequence_blocks(pooler: nn.Module, token_feats: torch.Tensor):
+	"""Apply AttentivePooler sequence blocks over the full token sequence."""
+	seq_tokens = token_feats
+	blocks = getattr(pooler, "blocks", None)
+	if blocks is not None:
+		for blk in blocks:
+			seq_tokens = blk(seq_tokens)
+	return seq_tokens
+
+
+def _temporal_query_pool(pooler: nn.Module, token_feats: torch.Tensor, clip_length: int):
+	"""Apply the probe queries to each frame after full-sequence refinement."""
 	if pooler is None:
 		raise RuntimeError("Probe pooler is missing; cannot extract temporal probe features.")
 	if not hasattr(pooler, "query_tokens") or not hasattr(pooler, "cross_attention_block"):
 		raise RuntimeError("Unexpected pooler implementation; query_tokens/cross_attention_block not found.")
 
-	# Reuse the probe's self-attention sequence refinement when available.
-	if hasattr(pooler, "forward_sequence"):
-		seq_tokens = pooler.forward_sequence(token_feats)
-	else:
-		seq_tokens = token_feats
-
+	seq_tokens = _apply_pooler_sequence_blocks(pooler, token_feats)
 	token_grid = _reshape_tokens_to_temporal_grid(seq_tokens, clip_length)  # [B, T, S, D]
 	batch_size, temporal_dim, tokens_per_frame, feat_dim = token_grid.shape
 	frame_tokens = token_grid.reshape(batch_size * temporal_dim, tokens_per_frame, feat_dim)
 	query_count = pooler.query_tokens.shape[1]
-	if query_count < 3:
-		raise RuntimeError(f"Expected at least 3 query tokens for verb/noun/action, got {query_count}.")
-
 	queries = pooler.query_tokens.repeat(frame_tokens.shape[0], 1, 1)
 	pooled = pooler.cross_attention_block(queries, frame_tokens)  # [B*T, Q, D]
-	pooled = pooled.reshape(batch_size, temporal_dim, query_count, feat_dim)
-	head_temporal = dict(
-		verb=pooled[:, :, 0, :],
-		noun=pooled[:, :, 1, :],
-		action=pooled[:, :, 2, :],
-	)
+	return pooled.reshape(batch_size, temporal_dim, query_count, feat_dim)
 
-	return head_temporal
+
+def extract_probe_temporal_features(pooler: nn.Module, token_feats: torch.Tensor, clip_length: int, head_names=None):
+	"""
+	Extract attentive probe temporal features [B, T, D] or head-wise temporal
+	features by applying the probe's learned query tokens to each frame's spatial tokens.
+	"""
+	pooled = _temporal_query_pool(pooler, token_feats, clip_length)
+	batch_size, temporal_dim, query_count, feat_dim = pooled.shape
+	if head_names is None:
+		if query_count == 1:
+			head_names = ("probe",)
+		elif query_count == 3:
+			head_names = ("verb", "noun", "action")
+		else:
+			raise RuntimeError(f"Unsupported query count {query_count}; provide explicit head_names.")
+	if query_count != len(head_names):
+		raise RuntimeError(
+			f"Probe query count {query_count} does not match requested head names {head_names}."
+		)
+
+	if query_count == 1:
+		return pooled[:, :, 0, :]
+	return {name: pooled[:, :, idx, :] for idx, name in enumerate(head_names)}
 
 
 def extract_motion_features(encoder: nn.Module, inputs: torch.Tensor, clip_length: int):
@@ -604,19 +861,31 @@ def forward_with_features(model, model_type, activation, inputs, args):
 		encoder = getattr(model_without_ddp, 'encoder', None)
 		if encoder is None:
 			raise RuntimeError("V-JEPA2 model is missing encoder; cannot extract features.")
+		token_temporal_length = _get_token_temporal_length(encoder, inputs, args.clip_length)
 		if args.multi_task:
-			logits, tokens, probe_feats = model(inputs, return_features=True)
-			feat = reshape_temporal_features(tokens, args.clip_length)
+			if getattr(args, 'vjepa2_head', 'attentive') == 'temporal_attentive':
+				logits, tokens, probe_feats, temporal_probe_feat = model(inputs, return_features=True)
+			else:
+				logits, tokens, probe_feats = model(inputs, return_features=True)
+			feat = reshape_temporal_features(tokens, token_temporal_length)
 			cls_feat = probe_feats
-			pooler = getattr(getattr(model_without_ddp, 'probe', None), 'pooler', None)
-			token_temporal_length = _get_token_temporal_length(encoder, inputs, args.clip_length)
-			temporal_probe_feat = extract_head_temporal_features(pooler, tokens, token_temporal_length)
+			if temporal_probe_feat is None:
+				pooler = getattr(getattr(model_without_ddp, 'probe', None), 'pooler', None)
+				temporal_probe_feat = extract_probe_temporal_features(
+					pooler, tokens, token_temporal_length, head_names=("verb", "noun", "action")
+				)
 		else:
-			logits, tokens, pooled = model(inputs, return_features=True)
-			feat = reshape_temporal_features(tokens, args.clip_length)
+			if getattr(args, 'vjepa2_head', 'attentive') == 'temporal_attentive':
+				logits, tokens, pooled, temporal_probe_feat = model(inputs, return_features=True)
+			else:
+				logits, tokens, pooled = model(inputs, return_features=True)
+			feat = reshape_temporal_features(tokens, token_temporal_length)
 			cls_feat = pooled
+			if temporal_probe_feat is None and getattr(args, 'vjepa2_head', 'attentive') == 'attentive' and hasattr(model_without_ddp, 'probe'):
+				pooler = getattr(model_without_ddp.probe, 'pooler', None)
+				temporal_probe_feat = extract_probe_temporal_features(pooler, tokens, token_temporal_length)
 		if _supports_motion_features(encoder):
-			verb_input_feat = extract_motion_features(encoder, inputs, args.clip_length)
+			verb_input_feat = extract_motion_features(encoder, inputs, token_temporal_length)
 	else:
 		logits = model(inputs)
 		token_output = activation['tokens']
@@ -656,7 +925,10 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 		hook_handle = model_without_ddp.mvit.blocks[-1].mlp.register_forward_hook(hook)
 
 	all_outputs, all_targets, all_feats, all_cls_feats = [], [], [], []
-	all_temporal_probe_feats = [] if args.multi_task else None
+	save_temporal_probe = args.multi_task or (
+		args.model_type in VJEPA2_MODEL_SPECS and getattr(args, 'vjepa2_head', 'attentive') in {'attentive', 'temporal_attentive'}
+	)
+	all_temporal_probe_feats = [] if save_temporal_probe else None
 	all_verb_input_feats = [] if args.model_type in VJEPA2_MODEL_SPECS else None
 	all_narration_ids = []
 	all_narration_row_index = []
@@ -731,7 +1003,7 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 				target_gpu = target.cuda(args.gpu, non_blocking=True)
 				if isinstance(images, list):
 					logits_crops, feats_crops, cls_crops = [], [], []
-					temporal_probe_crops = [] if args.multi_task else None
+					temporal_probe_crops = [] if save_temporal_probe else None
 					verb_input_crops = [] if args.model_type in VJEPA2_MODEL_SPECS else None
 					for crop in images:
 						crop = crop.cuda(args.gpu, non_blocking=True)
@@ -748,6 +1020,8 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 							if head not in temporal_probe_feat:
 								raise RuntimeError(f"Temporal probe features missing head '{head}'.")
 							temporal_probe_crops.append(temporal_probe_feat[head].unsqueeze(1).detach().cpu())
+						elif temporal_probe_crops is not None and temporal_probe_feat is not None:
+							temporal_probe_crops.append(temporal_probe_feat.unsqueeze(1).detach().cpu())
 						if verb_input_feat is not None:
 							verb_input_crops.append(verb_input_feat.unsqueeze(1).detach().cpu())
 						logits_crops.append(logits.unsqueeze(1).detach().cpu())
@@ -756,7 +1030,7 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 					all_outputs.append(torch.cat(logits_crops, dim=1))
 					all_feats.append(torch.cat(feats_crops, dim=1))
 					all_cls_feats.append(torch.cat(cls_crops, dim=1))
-					if args.multi_task:
+					if temporal_probe_crops is not None and len(temporal_probe_crops) > 0:
 						all_temporal_probe_feats.append(torch.cat(temporal_probe_crops, dim=1))
 					if verb_input_crops is not None and len(verb_input_crops) > 0:
 						all_verb_input_feats.append(torch.cat(verb_input_crops, dim=1))
@@ -775,6 +1049,8 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 						if head not in temporal_probe_feat:
 							raise RuntimeError(f"Temporal probe features missing head '{head}'.")
 						all_temporal_probe_feats.append(temporal_probe_feat[head].detach().cpu())
+					elif all_temporal_probe_feats is not None and temporal_probe_feat is not None:
+						all_temporal_probe_feats.append(temporal_probe_feat.detach().cpu())
 					if verb_input_feat is not None:
 						all_verb_input_feats.append(verb_input_feat.detach().cpu())
 					all_outputs.append(logits.detach().cpu())
@@ -797,8 +1073,11 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 	all_targets = torch.cat(all_targets)
 	if len(all_narration_row_index) > 0:
 		all_narration_row_index = torch.cat([value.view(-1) for value in all_narration_row_index], dim=0)
-	if args.multi_task:
-		all_temporal_probe_feats = torch.cat(all_temporal_probe_feats)
+	if all_temporal_probe_feats is not None:
+		if len(all_temporal_probe_feats) > 0:
+			all_temporal_probe_feats = torch.cat(all_temporal_probe_feats)
+		else:
+			all_temporal_probe_feats = None
 	if all_verb_input_feats is not None:
 		if len(all_verb_input_feats) > 0:
 			all_verb_input_feats = torch.cat(all_verb_input_feats)
@@ -820,7 +1099,7 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 		save_payload['narration_ids'] = all_narration_ids
 		save_payload['narration_row_index'] = all_narration_row_index
 		save_payload['video_ids'] = all_video_ids
-	if args.multi_task:
+	if all_temporal_probe_feats is not None:
 		save_payload['temporal_probe_feats'] = all_temporal_probe_feats
 	if all_verb_input_feats is not None:
 		save_payload['verb_input_feats'] = all_verb_input_feats
@@ -832,10 +1111,11 @@ def extract_split(loader, model, flow_model, args, subset: str, head: str = None
 		print(f"Saved {subset} features to {save_path}")
 	print(f"  feats: {all_feats.shape}")
 	print(f"  cls_feats: {all_cls_feats.shape}")
-	if args.multi_task:
+	if all_temporal_probe_feats is not None:
 		print(f"  temporal_probe_feats: {all_temporal_probe_feats.shape}")
-		print(f"  narration_ids: {len(all_narration_ids)}")
-		print(f"  narration_row_index: {all_narration_row_index.shape}")
+		if args.multi_task:
+			print(f"  narration_ids: {len(all_narration_ids)}")
+			print(f"  narration_row_index: {all_narration_row_index.shape}")
 	if all_verb_input_feats is not None:
 		print(f"  verb_input_feats: {all_verb_input_feats.shape}")
 	print(f"  outputs: {all_outputs.shape}")
@@ -873,12 +1153,17 @@ def get_args_parser():
 	parser.add_argument('--clip-length', default=16, type=int, help='clip length')
 	parser.add_argument('--clip-stride', default=2, type=int, help='clip stride')
 	parser.add_argument('--sparse-sample', action='store_true', help='switch to sparse sampling')
+	parser.add_argument('--use-timestamps', action='store_true',
+						help='use timestamps instead of frame numbers for EK100')
 	parser.add_argument('--batch-size', default=8, type=int, help='number of samples per GPU for extraction')
 
 	# Model
 	parser.add_argument('--model-type', default='vjepa2_large', type=str,
 						choices=['mvit_spatial', 'mvit_temporal'] + list(VJEPA2_MODEL_SPECS.keys()),
 						help='backbone to use for extraction')
+	parser.add_argument('--vjepa2-head', default='attentive', type=str,
+						choices=['attentive', 'temporal_attentive', 'meanpool'],
+						help='single-task V-JEPA2 head to instantiate during extraction')
 	parser.add_argument('--pretrain-model', default='', type=str, help='path to checkpoint to load')
 	parser.add_argument('--resume', default='', type=str, help='alternative checkpoint path')
 	parser.add_argument('--skip-checkpoint', action='store_true',
@@ -970,31 +1255,67 @@ def main(args):
 		else:
 			print("Initializing V-JEPA backbone architecture only; external checkpoint will provide weights.")
 
-	# Build model
-	if args.model_type == 'mvit_spatial':
-		model = MViT_Spatial(args.num_classes, dropout=args.dropout_ratio)
-	elif args.model_type == 'mvit_temporal':
-		model = MViT_Temporal(args.num_classes, dropout=args.dropout_ratio)
-	elif args.model_type in VJEPA2_MODEL_SPECS:
-		if args.multi_task:
-			model = VJEPA2MultiTaskProbeClassifier(
-				args.model_type,
-				num_verb_classes=args.num_classes_verb,
-				num_noun_classes=args.num_classes_noun,
-				num_action_classes=args.num_classes_action,
-				probe_num_heads=args.probe_num_heads,
-				probe_num_blocks=args.probe_num_blocks,
-				probe_mlp_ratio=args.probe_mlp_ratio,
-				probe_dropout=args.probe_dropout,
-				use_activation_checkpointing=args.probe_use_activation_checkpointing,
-				pretrained_backbone=pretrained_backbone,
-			)
+		# Build model
+		if args.model_type == 'mvit_spatial':
+			model = MViT_Spatial(args.num_classes, dropout=args.dropout_ratio)
+		elif args.model_type == 'mvit_temporal':
+			model = MViT_Temporal(args.num_classes, dropout=args.dropout_ratio)
+		elif args.model_type in VJEPA2_MODEL_SPECS:
+			if args.multi_task:
+				if args.vjepa2_head == 'temporal_attentive':
+					model = VJEPA2TemporalMultiTaskProbeClassifier(
+						args.model_type,
+						num_verb_classes=args.num_classes_verb,
+						num_noun_classes=args.num_classes_noun,
+						num_action_classes=args.num_classes_action,
+						probe_num_heads=args.probe_num_heads,
+						probe_num_blocks=args.probe_num_blocks,
+						probe_mlp_ratio=args.probe_mlp_ratio,
+						probe_dropout=args.probe_dropout,
+						use_activation_checkpointing=args.probe_use_activation_checkpointing,
+						pretrained_backbone=pretrained_backbone,
+					)
+				else:
+					model = VJEPA2MultiTaskProbeClassifier(
+						args.model_type,
+						num_verb_classes=args.num_classes_verb,
+						num_noun_classes=args.num_classes_noun,
+						num_action_classes=args.num_classes_action,
+						probe_num_heads=args.probe_num_heads,
+						probe_num_blocks=args.probe_num_blocks,
+						probe_mlp_ratio=args.probe_mlp_ratio,
+						probe_dropout=args.probe_dropout,
+						use_activation_checkpointing=args.probe_use_activation_checkpointing,
+						pretrained_backbone=pretrained_backbone,
+					)
+			elif args.vjepa2_head == 'meanpool':
+				model = VJEPA2MeanPoolClassifier(
+					args.model_type, args.num_classes, dropout=args.dropout_ratio, pretrained_backbone=pretrained_backbone
+				)
+			elif args.vjepa2_head == 'temporal_attentive':
+				model = VJEPA2TemporalProbeClassifier(
+					args.model_type,
+					args.num_classes,
+					probe_num_heads=args.probe_num_heads,
+					probe_num_blocks=args.probe_num_blocks,
+					probe_mlp_ratio=args.probe_mlp_ratio,
+					probe_dropout=args.probe_dropout,
+					use_activation_checkpointing=args.probe_use_activation_checkpointing,
+					pretrained_backbone=pretrained_backbone,
+				)
+			else:
+				model = VJEPA2ProbeClassifier(
+					args.model_type,
+					args.num_classes,
+					probe_num_heads=args.probe_num_heads,
+					probe_num_blocks=args.probe_num_blocks,
+					probe_mlp_ratio=args.probe_mlp_ratio,
+					probe_dropout=args.probe_dropout,
+					use_activation_checkpointing=args.probe_use_activation_checkpointing,
+					pretrained_backbone=pretrained_backbone,
+				)
 		else:
-			model = VJEPA2FeatureExtractor(
-				args.model_type, args.num_classes, dropout=args.dropout_ratio, pretrained_backbone=pretrained_backbone
-			)
-	else:
-		raise ValueError(f'Unknown model type: {args.model_type}')
+			raise ValueError(f'Unknown model type: {args.model_type}')
 
 	# Load checkpoint (optional)
 	ckpt_path = args.resume or args.pretrain_model

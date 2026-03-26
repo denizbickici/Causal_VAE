@@ -80,9 +80,18 @@ CLIP_STRIDE=2
 NUM_WORKERS=24
 SEED=42
 
+# V-JEPA2 extraction settings
+VJEPA2_HEAD="${VJEPA2_HEAD:-temporal_attentive}"   # temporal_attentive | attentive | meanpool
+MULTI_TASK="${MULTI_TASK:-0}"             # set to 1 only for joint verb+noun+action extraction
+USE_TIMESTAMPS="${USE_TIMESTAMPS:-1}"
+
 MULTI_TASK_FLAGS=""
 NUM_CLASSES_FLAG=""
-if [ "$DATASET" = "ek100_cls" ] && [[ "$MODEL_TYPE" == vjepa2_* ]]; then
+if [ "$MULTI_TASK" = "1" ]; then
+    if [ "$DATASET" != "ek100_cls" ] || [[ "$MODEL_TYPE" != vjepa2_* ]]; then
+        echo "MULTI_TASK=1 is only supported for EK100 + V-JEPA2 models"
+        exit 1
+    fi
     TASK_TYPE="action"
     OUTPUT_DIR="/scratch/users/bickici/data/EK100/vjepa_features/${MODEL_TYPE}_${DATASET}_multitask"
     MULTI_TASK_FLAGS="--multi-task --probe-num-blocks 4 --probe-num-heads 16"
@@ -103,6 +112,8 @@ mkdir -p "$OUTPUT_DIR"
 echo "=========================================="
 echo "Extracting model: $MODEL_TYPE"
 echo "Dataset: $DATASET | Task: $TASK_TYPE"
+echo "V-JEPA2 head: $VJEPA2_HEAD"
+echo "Multi-task: $MULTI_TASK"
 echo "Output dir: $OUTPUT_DIR"
 echo "=========================================="
 
@@ -115,6 +126,7 @@ CMD="python3 main_extract_feature_vjepa_probe.py \
     --ek100-val-csv $VAL_META \
     --root $ROOT_DIR \
     --model-type $MODEL_TYPE \
+    --vjepa2-head $VJEPA2_HEAD \
     --batch-size $BATCH_SIZE \
     --num-clips $NUM_CLIPS \
     --num-crops $NUM_CROPS \
@@ -125,6 +137,10 @@ CMD="python3 main_extract_feature_vjepa_probe.py \
     --workers $NUM_WORKERS \
     $MULTI_TASK_FLAGS \
     $NUM_CLASSES_FLAG"
+
+if [ "$USE_TIMESTAMPS" = "1" ]; then
+    CMD="$CMD --use-timestamps"
+fi
 
 if [ -n "$PRETRAIN_MODEL" ]; then
     CMD="$CMD --pretrain-model $PRETRAIN_MODEL"

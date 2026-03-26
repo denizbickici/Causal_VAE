@@ -36,7 +36,8 @@ python -c "import torch; print(f'PyTorch version: {torch.version}'); print(f'CUD
 #   ./train_vjepa2.sh [MODEL_TYPE] [DATASET] [TASK_TYPE] [extra args...]
 # Examples:
 #   ./train_vjepa2.sh vjepa2_large ek100_cls verb
-#   ./train_vjepa2.sh vjepa2_giant_384 ek100_cls action --batch-size 4
+#   ./train_vjepa2.sh vjepa2_giant_384 ek100_cls noun
+#   MULTI_TASK=1 ./train_vjepa2.sh vjepa2_huge ek100_cls action
 #   ./train_vjepa2.sh mvit_spatial egtea action
 #
 # MODEL_TYPE options (from main_train_vjepa_probe.py):
@@ -84,8 +85,18 @@ CLIP_STRIDE=2
 NUM_WORKERS=24
 SEED=42
 
+# V-JEPA2 probe settings
+VJEPA2_HEAD="${VJEPA2_HEAD:-temporal_attentive}"   # temporal_attentive | attentive | meanpool
+MULTI_TASK="${MULTI_TASK:-0}"             # set to 1 only for joint verb+noun+action training
+USE_FOCAL_LOSS="${USE_FOCAL_LOSS:-1}"
+USE_TIMESTAMPS="${USE_TIMESTAMPS:-1}"
+
 MULTI_TASK_FLAGS=""
-if [ "$DATASET" = "ek100_cls" ] && [[ "$MODEL_TYPE" == vjepa2_* ]]; then
+if [ "$MULTI_TASK" = "1" ]; then
+    if [ "$DATASET" != "ek100_cls" ] || [[ "$MODEL_TYPE" != vjepa2_* ]]; then
+        echo "MULTI_TASK=1 is only supported for EK100 + V-JEPA2 models"
+        exit 1
+    fi
     TASK_TYPE="action"
     OUTPUT_DIR="/scratch/users/bickici/data/EK100/model_checkpoints/${MODEL_TYPE}_${DATASET}_multitask"
     MULTI_TASK_FLAGS="--multi-task --probe-num-blocks 4 --probe-num-heads 16"
@@ -98,6 +109,8 @@ mkdir -p "$OUTPUT_DIR"
 echo "=========================================="
 echo "Training model: $MODEL_TYPE"
 echo "Dataset: $DATASET | Task: $TASK_TYPE"
+echo "V-JEPA2 head: $VJEPA2_HEAD"
+echo "Multi-task: $MULTI_TASK"
 echo "Output dir: $OUTPUT_DIR"
 echo "=========================================="
 
@@ -111,6 +124,7 @@ CMD="python main_train_vjepa_probe.py \
     --output-dir $OUTPUT_DIR \
     --model-type $MODEL_TYPE \
     --task-type $TASK_TYPE \
+    --vjepa2-head $VJEPA2_HEAD \
     --batch-size $BATCH_SIZE \
     --lr $LR \
     --wd $WD \
@@ -125,8 +139,15 @@ CMD="python main_train_vjepa_probe.py \
     --workers $NUM_WORKERS \
     --seed $SEED \
     --print-freq 100 \
-    --use-timestamps \
     $MULTI_TASK_FLAGS"
+
+if [ "$USE_FOCAL_LOSS" = "1" ]; then
+    CMD="$CMD --use-focal-loss"
+fi
+
+if [ "$USE_TIMESTAMPS" = "1" ]; then
+    CMD="$CMD --use-timestamps"
+fi
 
 if [ -n "$PRETRAIN_MODEL" ]; then
     CMD="$CMD --pretrain-model $PRETRAIN_MODEL"

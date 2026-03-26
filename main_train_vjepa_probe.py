@@ -247,6 +247,59 @@ class VJEPA2MeanPoolClassifier(nn.Module):
         return self.classifier(pooled)
 
 
+def _reshape_tokens_to_temporal_grid(token_feats: torch.Tensor, clip_length: int):
+    """Reshape token features to [B, T, S, D]."""
+    if clip_length <= 0:
+        raise ValueError(f"clip_length must be > 0, got {clip_length}")
+    token_count = token_feats.shape[1]
+    if token_count % clip_length == 0:
+        tokens_per_frame = token_count // clip_length
+        return token_feats.reshape(token_feats.shape[0], clip_length, tokens_per_frame, token_feats.shape[-1])
+    if token_count > 1 and (token_count - 1) % clip_length == 0:
+        patch_tokens = token_feats[:, 1:, :]
+        tokens_per_frame = patch_tokens.shape[1] // clip_length
+        return patch_tokens.reshape(token_feats.shape[0], clip_length, tokens_per_frame, token_feats.shape[-1])
+    raise RuntimeError(
+        f"Cannot reshape token tensor of shape {tuple(token_feats.shape)} into [B, T, S, D] "
+        f"with clip_length={clip_length}."
+    )
+
+
+def _get_token_temporal_length(encoder: nn.Module, inputs: torch.Tensor):
+    """Infer temporal token length (tubelet-aware) from the video input."""
+    frame_count = 1
+    if inputs.ndim == 5:
+        frame_count = int(inputs.shape[2])
+    tubelet_size = int(getattr(encoder, "tubelet_size", 1) or 1)
+    if tubelet_size < 1:
+        tubelet_size = 1
+    return max(1, frame_count // tubelet_size)
+
+
+def _apply_pooler_sequence_blocks(pooler: nn.Module, token_feats: torch.Tensor):
+    """Apply AttentivePooler sequence blocks over the full token sequence."""
+    seq_tokens = token_feats
+    blocks = getattr(pooler, "blocks", None)
+    if blocks is not None:
+        for blk in blocks:
+            if getattr(pooler, "use_activation_checkpointing", False):
+                seq_tokens = torch.utils.checkpoint.checkpoint(blk, seq_tokens, False, None, use_reentrant=False)
+            else:
+                seq_tokens = blk(seq_tokens)
+    return seq_tokens
+
+
+def _temporal_query_pool(pooler: nn.Module, token_feats: torch.Tensor, clip_length: int):
+    """Apply the probe queries to each frame after full-sequence refinement."""
+    seq_tokens = _apply_pooler_sequence_blocks(pooler, token_feats)
+    token_grid = _reshape_tokens_to_temporal_grid(seq_tokens, clip_length)  # [B, T, S, D]
+    batch_size, temporal_dim, tokens_per_frame, feat_dim = token_grid.shape
+    frame_tokens = token_grid.reshape(batch_size * temporal_dim, tokens_per_frame, feat_dim)
+    queries = pooler.query_tokens.repeat(frame_tokens.shape[0], 1, 1)
+    pooled = pooler.cross_attention_block(queries, frame_tokens)  # [B*T, Q, D]
+    return pooled.reshape(batch_size, temporal_dim, pooler.query_tokens.shape[1], feat_dim)
+
+
 class VJEPA2ProbeHead(nn.Module):
     """Attentive probe head matching the V-JEPA2 frozen evaluation setup."""
 
@@ -278,6 +331,40 @@ class VJEPA2ProbeHead(nn.Module):
         x = self.pooler(x).squeeze(1)
         x = self.dropout(x)
         return self.classifier(x)
+
+
+class VJEPA2TemporalProbeHead(nn.Module):
+    """Temporal-output attentive probe head trained on per-timestep task features."""
+
+    def __init__(
+        self,
+        variant_key,
+        embed_dim,
+        num_classes,
+        num_heads,
+        depth,
+        mlp_ratio=4.0,
+        dropout=0.0,
+        use_activation_checkpointing=True,
+    ):
+        super().__init__()
+        AttentivePooler = _get_vjepa2_attentive_pooler(variant_key)
+        self.pooler = AttentivePooler(
+            num_queries=1,
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            depth=depth,
+            mlp_ratio=mlp_ratio,
+            use_activation_checkpointing=use_activation_checkpointing,
+        )
+        self.dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
+        self.classifier = nn.Linear(embed_dim, num_classes)
+
+    def forward(self, x, temporal_length):
+        temporal_feats = _temporal_query_pool(self.pooler, x, temporal_length)[:, :, 0, :]
+        pooled = temporal_feats.mean(dim=1)
+        pooled = self.dropout(pooled)
+        return self.classifier(pooled)
 
 
 class VJEPA2MultiTaskProbeHead(nn.Module):
@@ -314,6 +401,47 @@ class VJEPA2MultiTaskProbeHead(nn.Module):
     def forward(self, x):
         x = self.pooler(x)
         x_verb, x_noun, x_action = x[:, 0, :], x[:, 1, :], x[:, 2, :]
+        x_verb = self.verb_classifier(self.dropout(x_verb))
+        x_noun = self.noun_classifier(self.dropout(x_noun))
+        x_action = self.action_classifier(self.dropout(x_action))
+        return dict(verb=x_verb, noun=x_noun, action=x_action)
+
+
+class VJEPA2TemporalMultiTaskProbeHead(nn.Module):
+    """Temporal-output attentive probe head with verb/noun/action classifiers."""
+
+    def __init__(
+        self,
+        variant_key,
+        embed_dim,
+        num_verb_classes,
+        num_noun_classes,
+        num_action_classes,
+        num_heads,
+        depth,
+        mlp_ratio=4.0,
+        dropout=0.0,
+        use_activation_checkpointing=True,
+    ):
+        super().__init__()
+        AttentivePooler = _get_vjepa2_attentive_pooler(variant_key)
+        self.pooler = AttentivePooler(
+            num_queries=3,
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            depth=depth,
+            mlp_ratio=mlp_ratio,
+            use_activation_checkpointing=use_activation_checkpointing,
+        )
+        self.dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
+        self.verb_classifier = nn.Linear(embed_dim, num_verb_classes, bias=True)
+        self.noun_classifier = nn.Linear(embed_dim, num_noun_classes, bias=True)
+        self.action_classifier = nn.Linear(embed_dim, num_action_classes, bias=True)
+
+    def forward(self, x, temporal_length):
+        temporal_feats = _temporal_query_pool(self.pooler, x, temporal_length)
+        pooled = temporal_feats.mean(dim=1)
+        x_verb, x_noun, x_action = pooled[:, 0, :], pooled[:, 1, :], pooled[:, 2, :]
         x_verb = self.verb_classifier(self.dropout(x_verb))
         x_noun = self.noun_classifier(self.dropout(x_noun))
         x_action = self.action_classifier(self.dropout(x_action))
@@ -370,6 +498,57 @@ class VJEPA2ProbeClassifier(nn.Module):
         return self.probe(features)
 
 
+class VJEPA2TemporalProbeClassifier(nn.Module):
+    """Frozen V-JEPA2 encoder with a temporal-output attentive probe head."""
+
+    def __init__(
+        self,
+        variant_key,
+        num_classes,
+        probe_num_heads=16,
+        probe_num_blocks=4,
+        probe_mlp_ratio=4.0,
+        probe_dropout=0.0,
+        use_activation_checkpointing=True,
+        freeze_encoder=True,
+        pretrained_backbone=True,
+    ):
+        super().__init__()
+        self.encoder = _load_vjepa2_encoder(variant_key, pretrained=pretrained_backbone)
+        self.num_features = self.encoder.embed_dim
+        self.freeze_encoder = freeze_encoder
+        if freeze_encoder:
+            for p in self.encoder.parameters():
+                p.requires_grad = False
+            self.encoder.eval()
+
+        self.probe = VJEPA2TemporalProbeHead(
+            variant_key=variant_key,
+            embed_dim=self.num_features,
+            num_classes=num_classes,
+            num_heads=probe_num_heads,
+            depth=probe_num_blocks,
+            mlp_ratio=probe_mlp_ratio,
+            dropout=probe_dropout,
+            use_activation_checkpointing=use_activation_checkpointing,
+        )
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.freeze_encoder:
+            self.encoder.eval()
+        return self
+
+    def forward(self, x, use_checkpoint=False):
+        if self.freeze_encoder:
+            with torch.no_grad():
+                features = self.encoder(x)
+        else:
+            features = self.encoder(x)
+        temporal_length = _get_token_temporal_length(self.encoder, x)
+        return self.probe(features, temporal_length)
+
+
 class VJEPA2MultiTaskProbeClassifier(nn.Module):
     """Frozen V-JEPA2 encoder with verb/noun/action attentive probes."""
 
@@ -422,6 +601,61 @@ class VJEPA2MultiTaskProbeClassifier(nn.Module):
         else:
             features = self.encoder(x)
         return self.probe(features)
+
+
+class VJEPA2TemporalMultiTaskProbeClassifier(nn.Module):
+    """Frozen V-JEPA2 encoder with temporal-output verb/noun/action probes."""
+
+    def __init__(
+        self,
+        variant_key,
+        num_verb_classes,
+        num_noun_classes,
+        num_action_classes,
+        probe_num_heads=16,
+        probe_num_blocks=4,
+        probe_mlp_ratio=4.0,
+        probe_dropout=0.0,
+        use_activation_checkpointing=True,
+        freeze_encoder=True,
+        pretrained_backbone=True,
+    ):
+        super().__init__()
+        self.encoder = _load_vjepa2_encoder(variant_key, pretrained=pretrained_backbone)
+        self.num_features = self.encoder.embed_dim
+        self.freeze_encoder = freeze_encoder
+        if freeze_encoder:
+            for p in self.encoder.parameters():
+                p.requires_grad = False
+            self.encoder.eval()
+
+        self.probe = VJEPA2TemporalMultiTaskProbeHead(
+            variant_key=variant_key,
+            embed_dim=self.num_features,
+            num_verb_classes=num_verb_classes,
+            num_noun_classes=num_noun_classes,
+            num_action_classes=num_action_classes,
+            num_heads=probe_num_heads,
+            depth=probe_num_blocks,
+            mlp_ratio=probe_mlp_ratio,
+            dropout=probe_dropout,
+            use_activation_checkpointing=use_activation_checkpointing,
+        )
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.freeze_encoder:
+            self.encoder.eval()
+        return self
+
+    def forward(self, x, use_checkpoint=False):
+        if self.freeze_encoder:
+            with torch.no_grad():
+                features = self.encoder(x)
+        else:
+            features = self.encoder(x)
+        temporal_length = _get_token_temporal_length(self.encoder, x)
+        return self.probe(features, temporal_length)
 
 
 class MViT_Spatial(nn.Module):
@@ -531,7 +765,7 @@ def get_args_parser():
     parser.add_argument('--resume', default='', type=str, help='path to resume from')
     parser.add_argument('--dropout-ratio', default=0.5, type=float, help='dropout ratio')
     parser.add_argument('--vjepa2-head', default='attentive', type=str,
-                        choices=['attentive', 'meanpool'],
+                        choices=['attentive', 'temporal_attentive', 'meanpool'],
                         help='classification head for V-JEPA2 models')
     parser.add_argument('--probe-num-heads', default=16, type=int,
                         help='attention heads in attentive probe (V-JEPA2)')
@@ -1651,11 +1885,40 @@ def main(args):
             model = MViT_Temporal(args.num_classes, dropout=args.dropout_ratio)
         elif args.model_type in VJEPA2_MODEL_SPECS:
             if args.multi_task:
-                model = VJEPA2MultiTaskProbeClassifier(
+                if args.vjepa2_head == 'temporal_attentive':
+                    model = VJEPA2TemporalMultiTaskProbeClassifier(
+                        args.model_type,
+                        num_verb_classes=args.num_classes_verb,
+                        num_noun_classes=args.num_classes_noun,
+                        num_action_classes=args.num_classes_action,
+                        probe_num_heads=args.probe_num_heads,
+                        probe_num_blocks=args.probe_num_blocks,
+                        probe_mlp_ratio=args.probe_mlp_ratio,
+                        probe_dropout=args.probe_dropout,
+                        use_activation_checkpointing=args.probe_use_activation_checkpointing,
+                        freeze_encoder=not args.unfreeze_encoder,
+                        pretrained_backbone=pretrained_backbone,
+                    )
+                else:
+                    model = VJEPA2MultiTaskProbeClassifier(
+                        args.model_type,
+                        num_verb_classes=args.num_classes_verb,
+                        num_noun_classes=args.num_classes_noun,
+                        num_action_classes=args.num_classes_action,
+                        probe_num_heads=args.probe_num_heads,
+                        probe_num_blocks=args.probe_num_blocks,
+                        probe_mlp_ratio=args.probe_mlp_ratio,
+                        probe_dropout=args.probe_dropout,
+                        use_activation_checkpointing=args.probe_use_activation_checkpointing,
+                        freeze_encoder=not args.unfreeze_encoder,
+                        pretrained_backbone=pretrained_backbone,
+                    )
+            elif args.vjepa2_head == 'meanpool':
+                model = VJEPA2MeanPoolClassifier(args.model_type, args.num_classes, dropout=args.dropout_ratio, pretrained_backbone=pretrained_backbone)
+            elif args.vjepa2_head == 'temporal_attentive':
+                model = VJEPA2TemporalProbeClassifier(
                     args.model_type,
-                    num_verb_classes=args.num_classes_verb,
-                    num_noun_classes=args.num_classes_noun,
-                    num_action_classes=args.num_classes_action,
+                    args.num_classes,
                     probe_num_heads=args.probe_num_heads,
                     probe_num_blocks=args.probe_num_blocks,
                     probe_mlp_ratio=args.probe_mlp_ratio,
@@ -1664,8 +1927,6 @@ def main(args):
                     freeze_encoder=not args.unfreeze_encoder,
                     pretrained_backbone=pretrained_backbone,
                 )
-            elif args.vjepa2_head == 'meanpool':
-                model = VJEPA2MeanPoolClassifier(args.model_type, args.num_classes, dropout=args.dropout_ratio, pretrained_backbone=pretrained_backbone)
             else:
                 model = VJEPA2ProbeClassifier(
                     args.model_type,
@@ -1979,6 +2240,8 @@ def main(args):
             opt_kwargs = opt_kwargs[:args.multihead_max_heads]
         if not opt_kwargs:
             raise ValueError("No multihead optimizer configurations found.")
+        if args.vjepa2_head == 'temporal_attentive':
+            raise ValueError("Multihead sweep is not supported for --vjepa2-head temporal_attentive.")
 
         if args.multi_task:
             classifiers = [
