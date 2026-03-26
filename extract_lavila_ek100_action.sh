@@ -36,6 +36,7 @@ CLIP_STRIDE="${CLIP_STRIDE:-2}"
 NUM_CLIPS="${NUM_CLIPS:-1}"
 NUM_CROPS="${NUM_CROPS:-1}"
 USE_VN_CLASSIFIER="${USE_VN_CLASSIFIER:-1}"
+USE_TIMESTAMPS="${USE_TIMESTAMPS:-0}"
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -74,6 +75,10 @@ if [ "$USE_VN_CLASSIFIER" = "1" ]; then
     CMD+=(--use-vn-classifier --num-classes 97 300 3806)
 else
     CMD+=(--num-classes 3806)
+fi
+
+if [ "$USE_TIMESTAMPS" = "1" ]; then
+    CMD+=(--use-timestamps)
 fi
 
 if [ $# -gt 0 ]; then

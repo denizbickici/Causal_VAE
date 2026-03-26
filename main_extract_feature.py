@@ -156,6 +156,8 @@ def get_args_parser():
 	parser.add_argument('--clip-length', default=16, type=int, help='clip length')
 	parser.add_argument('--clip-stride', default=2, type=int, help='clip stride')
 	parser.add_argument('--sparse-sample', action='store_true', help='switch to sparse sampling')
+	parser.add_argument('--use-timestamps', action='store_true',
+						help='use timestamps instead of frame numbers for EK100')
 	# Model
 	parser.add_argument('--pretrain-model', default='', type=str, help='path to pretrain model')
 	parser.add_argument('--resume', default='', type=str, help='path to resume from')
