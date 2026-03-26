@@ -307,7 +307,7 @@ def main(args):
         ])
 
     # build dataset
-    _, mapping_vn2act = generate_label_map(args.dataset)
+    _, mapping_vn2act = generate_label_map(args.dataset, args)
     if args.dataset == 'ek100_cls':
         args.mapping_act2v = {i: int(vn.split(':')[0]) for (vn, i) in mapping_vn2act.items()}
         args.mapping_act2n = {i: int(vn.split(':')[1]) for (vn, i) in mapping_vn2act.items()}
