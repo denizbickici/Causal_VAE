@@ -452,14 +452,18 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
         # compute output
         with amp.autocast(enabled=not args.disable_amp):
             output = model(images, use_checkpoint=args.use_checkpoint)
-            if isinstance(output, list):
-                assert len(output) == 3
+            if args.use_vn_classifier:
+                if isinstance(output, tuple):
+                    output = output[0]
+                assert isinstance(output, list) and len(output) == 3
                 target_to_verb = torch.tensor([args.mapping_act2v[a] for a in target.tolist()]).cuda(args.gpu, non_blocking=True)
                 loss = criterion(output[0], target_to_verb)
                 target_to_noun = torch.tensor([args.mapping_act2n[a] for a in target.tolist()]).cuda(args.gpu, non_blocking=True)
                 loss += criterion(output[1], target_to_noun)
                 loss += criterion(output[2], target)
             else:
+                if isinstance(output, tuple):
+                    output = output[0]
                 loss = criterion(output, target)
             loss /= args.update_freq
 
@@ -487,7 +491,7 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
         scaler.update()
         model.zero_grad(set_to_none=True)
 
-        if isinstance(output, list):
+        if args.use_vn_classifier:
             target_to_verb = torch.tensor([args.mapping_act2v[a] for a in target.tolist()]).cuda(args.gpu, non_blocking=True)
             acc1_verb, _ = accuracy(output[0], target_to_verb, topk=(1, 5))
             top1_verb.update(acc1_verb.item(), images.size(0))
@@ -666,6 +670,9 @@ def validate_multihead(val_loader, model, args):
                 if args.use_half:
                     crop = crop.half()
                 logit = model(crop, use_checkpoint=args.use_checkpoint)
+                if isinstance(logit, tuple):
+                    logit = logit[0]
+                assert isinstance(logit, list) and len(logit) == 3
                 logit_verb_allcrops.append(logit[0])
                 logit_noun_allcrops.append(logit[1])
                 logit_action_allcrops.append(logit[2])
