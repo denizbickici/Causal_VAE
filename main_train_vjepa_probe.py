@@ -367,8 +367,57 @@ class VJEPA2TemporalProbeHead(nn.Module):
         return self.classifier(pooled)
 
 
-class VJEPA2MultiTaskProbeHead(nn.Module):
-    """Attentive probe head with verb/noun/action classifiers."""
+class _CompositionalActionHeadMixin:
+    def _init_compositional_heads(
+        self,
+        embed_dim,
+        num_verb_classes,
+        num_noun_classes,
+        num_action_classes,
+        action_to_verb,
+        action_to_noun,
+        composition_alpha,
+        dropout,
+    ):
+        if action_to_verb is None or action_to_noun is None:
+            raise ValueError("Expected action_to_verb and action_to_noun tensors for compositional action scoring.")
+        if action_to_verb.shape != (num_action_classes,) or action_to_noun.shape != (num_action_classes,):
+            raise ValueError(
+                "Compositional action buffers must have shape [num_action_classes]. "
+                f"Got {tuple(action_to_verb.shape)} and {tuple(action_to_noun.shape)} for {num_action_classes} classes."
+            )
+
+        self.dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
+        self.verb_classifier = nn.Linear(embed_dim, num_verb_classes, bias=True)
+        self.noun_classifier = nn.Linear(embed_dim, num_noun_classes, bias=True)
+        self.action_classifier = nn.Linear(embed_dim, num_action_classes, bias=True)
+        self.composition_alpha = float(composition_alpha)
+        self.register_buffer(
+            "action_to_verb",
+            action_to_verb.detach().clone().to(dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "action_to_noun",
+            action_to_noun.detach().clone().to(dtype=torch.long),
+            persistent=False,
+        )
+
+    def _forward_from_pooled_feature(self, pooled):
+        pooled = self.dropout(pooled)
+        verb_logits = self.verb_classifier(pooled)
+        noun_logits = self.noun_classifier(pooled)
+        baseline_action_logits = self.action_classifier(pooled)
+        compositional_action_logits = (
+            verb_logits[:, self.action_to_verb]
+            + noun_logits[:, self.action_to_noun]
+        )
+        action_logits = baseline_action_logits + self.composition_alpha * compositional_action_logits
+        return dict(verb=verb_logits, noun=noun_logits, action=action_logits)
+
+
+class VJEPA2MultiTaskProbeHead(_CompositionalActionHeadMixin, nn.Module):
+    """Attentive probe head with compositional verb+noun action correction."""
 
     def __init__(
         self,
@@ -377,38 +426,43 @@ class VJEPA2MultiTaskProbeHead(nn.Module):
         num_verb_classes,
         num_noun_classes,
         num_action_classes,
+        action_to_verb,
+        action_to_noun,
         num_heads,
         depth,
         mlp_ratio=4.0,
         dropout=0.0,
+        composition_alpha=1.0,
         use_activation_checkpointing=True,
     ):
         super().__init__()
         AttentivePooler = _get_vjepa2_attentive_pooler(variant_key)
         self.pooler = AttentivePooler(
-            num_queries=3,
+            num_queries=1,
             embed_dim=embed_dim,
             num_heads=num_heads,
             depth=depth,
             mlp_ratio=mlp_ratio,
             use_activation_checkpointing=use_activation_checkpointing,
         )
-        self.dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
-        self.verb_classifier = nn.Linear(embed_dim, num_verb_classes, bias=True)
-        self.noun_classifier = nn.Linear(embed_dim, num_noun_classes, bias=True)
-        self.action_classifier = nn.Linear(embed_dim, num_action_classes, bias=True)
+        self._init_compositional_heads(
+            embed_dim=embed_dim,
+            num_verb_classes=num_verb_classes,
+            num_noun_classes=num_noun_classes,
+            num_action_classes=num_action_classes,
+            action_to_verb=action_to_verb,
+            action_to_noun=action_to_noun,
+            composition_alpha=composition_alpha,
+            dropout=dropout,
+        )
 
     def forward(self, x):
-        x = self.pooler(x)
-        x_verb, x_noun, x_action = x[:, 0, :], x[:, 1, :], x[:, 2, :]
-        x_verb = self.verb_classifier(self.dropout(x_verb))
-        x_noun = self.noun_classifier(self.dropout(x_noun))
-        x_action = self.action_classifier(self.dropout(x_action))
-        return dict(verb=x_verb, noun=x_noun, action=x_action)
+        pooled = self.pooler(x).squeeze(1)
+        return self._forward_from_pooled_feature(pooled)
 
 
-class VJEPA2TemporalMultiTaskProbeHead(nn.Module):
-    """Temporal-output attentive probe head with verb/noun/action classifiers."""
+class VJEPA2TemporalMultiTaskProbeHead(_CompositionalActionHeadMixin, nn.Module):
+    """Temporal-output attentive probe head with compositional action correction."""
 
     def __init__(
         self,
@@ -417,35 +471,40 @@ class VJEPA2TemporalMultiTaskProbeHead(nn.Module):
         num_verb_classes,
         num_noun_classes,
         num_action_classes,
+        action_to_verb,
+        action_to_noun,
         num_heads,
         depth,
         mlp_ratio=4.0,
         dropout=0.0,
+        composition_alpha=1.0,
         use_activation_checkpointing=True,
     ):
         super().__init__()
         AttentivePooler = _get_vjepa2_attentive_pooler(variant_key)
         self.pooler = AttentivePooler(
-            num_queries=3,
+            num_queries=1,
             embed_dim=embed_dim,
             num_heads=num_heads,
             depth=depth,
             mlp_ratio=mlp_ratio,
             use_activation_checkpointing=use_activation_checkpointing,
         )
-        self.dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
-        self.verb_classifier = nn.Linear(embed_dim, num_verb_classes, bias=True)
-        self.noun_classifier = nn.Linear(embed_dim, num_noun_classes, bias=True)
-        self.action_classifier = nn.Linear(embed_dim, num_action_classes, bias=True)
+        self._init_compositional_heads(
+            embed_dim=embed_dim,
+            num_verb_classes=num_verb_classes,
+            num_noun_classes=num_noun_classes,
+            num_action_classes=num_action_classes,
+            action_to_verb=action_to_verb,
+            action_to_noun=action_to_noun,
+            composition_alpha=composition_alpha,
+            dropout=dropout,
+        )
 
     def forward(self, x, temporal_length):
         temporal_feats = _temporal_query_pool(self.pooler, x, temporal_length)
-        pooled = temporal_feats.mean(dim=1)
-        x_verb, x_noun, x_action = pooled[:, 0, :], pooled[:, 1, :], pooled[:, 2, :]
-        x_verb = self.verb_classifier(self.dropout(x_verb))
-        x_noun = self.noun_classifier(self.dropout(x_noun))
-        x_action = self.action_classifier(self.dropout(x_action))
-        return dict(verb=x_verb, noun=x_noun, action=x_action)
+        pooled = temporal_feats.mean(dim=1).squeeze(1)
+        return self._forward_from_pooled_feature(pooled)
 
 
 class VJEPA2ProbeClassifier(nn.Module):
@@ -550,7 +609,7 @@ class VJEPA2TemporalProbeClassifier(nn.Module):
 
 
 class VJEPA2MultiTaskProbeClassifier(nn.Module):
-    """Frozen V-JEPA2 encoder with verb/noun/action attentive probes."""
+    """Frozen V-JEPA2 encoder with compositional verb+noun action probes."""
 
     def __init__(
         self,
@@ -558,10 +617,13 @@ class VJEPA2MultiTaskProbeClassifier(nn.Module):
         num_verb_classes,
         num_noun_classes,
         num_action_classes,
+        action_to_verb,
+        action_to_noun,
         probe_num_heads=16,
         probe_num_blocks=4,
         probe_mlp_ratio=4.0,
         probe_dropout=0.0,
+        composition_alpha=1.0,
         use_activation_checkpointing=True,
         freeze_encoder=True,
         pretrained_backbone=True,
@@ -581,10 +643,13 @@ class VJEPA2MultiTaskProbeClassifier(nn.Module):
             num_verb_classes=num_verb_classes,
             num_noun_classes=num_noun_classes,
             num_action_classes=num_action_classes,
+            action_to_verb=action_to_verb,
+            action_to_noun=action_to_noun,
             num_heads=probe_num_heads,
             depth=probe_num_blocks,
             mlp_ratio=probe_mlp_ratio,
             dropout=probe_dropout,
+            composition_alpha=composition_alpha,
             use_activation_checkpointing=use_activation_checkpointing,
         )
 
@@ -604,7 +669,7 @@ class VJEPA2MultiTaskProbeClassifier(nn.Module):
 
 
 class VJEPA2TemporalMultiTaskProbeClassifier(nn.Module):
-    """Frozen V-JEPA2 encoder with temporal-output verb/noun/action probes."""
+    """Frozen V-JEPA2 encoder with temporal-output compositional action probes."""
 
     def __init__(
         self,
@@ -612,10 +677,13 @@ class VJEPA2TemporalMultiTaskProbeClassifier(nn.Module):
         num_verb_classes,
         num_noun_classes,
         num_action_classes,
+        action_to_verb,
+        action_to_noun,
         probe_num_heads=16,
         probe_num_blocks=4,
         probe_mlp_ratio=4.0,
         probe_dropout=0.0,
+        composition_alpha=1.0,
         use_activation_checkpointing=True,
         freeze_encoder=True,
         pretrained_backbone=True,
@@ -635,10 +703,13 @@ class VJEPA2TemporalMultiTaskProbeClassifier(nn.Module):
             num_verb_classes=num_verb_classes,
             num_noun_classes=num_noun_classes,
             num_action_classes=num_action_classes,
+            action_to_verb=action_to_verb,
+            action_to_noun=action_to_noun,
             num_heads=probe_num_heads,
             depth=probe_num_blocks,
             mlp_ratio=probe_mlp_ratio,
             dropout=probe_dropout,
+            composition_alpha=composition_alpha,
             use_activation_checkpointing=use_activation_checkpointing,
         )
 
@@ -818,6 +889,10 @@ def get_args_parser():
                         help='loss weight for noun head (multi-task)')
     parser.add_argument('--action-loss-weight', default=1.0, type=float,
                         help='loss weight for action head (multi-task)')
+    parser.add_argument('--composition-alpha', default=1.0, type=float,
+                        help='fusion weight for compositional verb+noun action correction')
+    parser.add_argument('--composition-aux-weight', default=0.3, type=float,
+                        help='auxiliary loss weight for verb/noun supervision in compositional multi-task training')
     parser.add_argument('--clip-grad-value', default=1.0, type=float, help='gradient clipping')
     parser.add_argument('--update-freq', default=1, type=int,
                         help='gradient accumulation steps')
@@ -978,20 +1053,25 @@ def compute_class_weights(args, train_dataset, label_mapping):
     return torch.tensor(weights, dtype=torch.float32)
 
 
-def build_ek100_multitask_label_maps(train_csv):
+def build_ek100_multitask_label_maps(*csv_paths):
+    csv_paths = [csv_path for csv_path in csv_paths if csv_path]
+    if not csv_paths:
+        raise ValueError("At least one EK100 CSV path is required to build multi-task label maps.")
+
     verb_set = set()
     noun_set = set()
     action_set = set()
 
-    with open(train_csv) as f:
-        csv_reader = csv.reader(f)
-        _ = next(csv_reader)
-        for row in csv_reader:
-            verb = int(row[10])
-            noun = int(row[12])
-            verb_set.add(str(verb))
-            noun_set.add(str(noun))
-            action_set.add(f"{verb}:{noun}")
+    for csv_path in csv_paths:
+        with open(csv_path) as f:
+            csv_reader = csv.reader(f)
+            _ = next(csv_reader)
+            for row in csv_reader:
+                verb = int(row[10])
+                noun = int(row[12])
+                verb_set.add(str(verb))
+                noun_set.add(str(noun))
+                action_set.add(f"{verb}:{noun}")
 
     verb_list = sorted(verb_set, key=int)
     noun_list = sorted(noun_set, key=int)
@@ -1002,6 +1082,37 @@ def build_ek100_multitask_label_maps(train_csv):
     action_map = {a: i for i, a in enumerate(action_list)}
 
     return dict(verb=verb_map, noun=noun_map, action=action_map)
+
+
+def build_ek100_action_component_tensors(label_maps):
+    action_map = label_maps["action"]
+    verb_map = label_maps["verb"]
+    noun_map = label_maps["noun"]
+    num_actions = len(action_map)
+
+    action_ids = set(action_map.values())
+    expected_ids = set(range(num_actions))
+    if action_ids != expected_ids:
+        raise ValueError(
+            "Action ids must be contiguous and zero-based to build compositional buffers. "
+            f"Found ids {sorted(action_ids)[:10]}... for {num_actions} actions."
+        )
+
+    action_to_verb = torch.empty(num_actions, dtype=torch.long)
+    action_to_noun = torch.empty(num_actions, dtype=torch.long)
+    for action_key, action_id in action_map.items():
+        parts = action_key.split(":")
+        if len(parts) != 2:
+            raise ValueError(f"Invalid EK100 action key '{action_key}'. Expected '<verb>:<noun>'.")
+        verb_key, noun_key = parts
+        if verb_key not in verb_map:
+            raise KeyError(f"Missing verb mapping for action '{action_key}' (verb={verb_key}).")
+        if noun_key not in noun_map:
+            raise KeyError(f"Missing noun mapping for action '{action_key}' (noun={noun_key}).")
+        action_to_verb[action_id] = verb_map[verb_key]
+        action_to_noun[action_id] = noun_map[noun_key]
+
+    return action_to_verb, action_to_noun
 
 
 def compute_multitask_class_weights(train_dataset, label_maps):
@@ -1068,7 +1179,12 @@ class EK100MultiTaskDataset(VideoCaptionDatasetBase):
         action_key = f"{verb_key}:{noun_key}"
         verb_label = self.label_maps["verb"][verb_key]
         noun_label = self.label_maps["noun"][noun_key]
-        action_label = self.label_maps["action"].get(action_key, -1)
+        if action_key not in self.label_maps["action"]:
+            raise KeyError(
+                f"Missing action mapping for EK100 sample '{action_key}'. "
+                "Rebuild label maps from all relevant splits before training."
+            )
+        action_label = self.label_maps["action"][action_key]
 
         return frames, verb_label, noun_label, action_label
 
@@ -1198,9 +1314,11 @@ def train(train_loader, model, flow_model, criterion, optimizer, scaler, epoch, 
                 loss_noun = criterion["noun"](output["noun"], noun_target)
                 loss_action = _masked_multitask_loss(output["action"], action_target, criterion["action"])
                 loss = (
-                    args.verb_loss_weight * loss_verb
-                    + args.noun_loss_weight * loss_noun
-                    + args.action_loss_weight * loss_action
+                    args.action_loss_weight * loss_action
+                    + args.composition_aux_weight * (
+                        args.verb_loss_weight * loss_verb
+                        + args.noun_loss_weight * loss_noun
+                    )
                 )
             else:
                 loss = criterion(output, target)
@@ -1350,9 +1468,11 @@ def train_multihead_epoch(
                     loss_noun = criterion["noun"](o["noun"], noun_target)
                     loss_action = _masked_multitask_loss(o["action"], action_target, criterion["action"])
                     total_loss = (
-                        args.verb_loss_weight * loss_verb
-                        + args.noun_loss_weight * loss_noun
-                        + args.action_loss_weight * loss_action
+                        args.action_loss_weight * loss_action
+                        + args.composition_aux_weight * (
+                            args.verb_loss_weight * loss_verb
+                            + args.noun_loss_weight * loss_noun
+                        )
                     )
                     losses_list.append(total_loss)
             else:
@@ -1806,19 +1926,27 @@ def main(args):
         os.makedirs(args.output_dir, exist_ok=True)
     
     label_maps = None
+    action_to_verb = None
+    action_to_noun = None
     if args.multi_task:
         if args.dataset != 'ek100_cls':
             raise ValueError("Multi-task training is only supported for EK100.")
         if args.model_type not in VJEPA2_MODEL_SPECS:
             raise ValueError("Multi-task training is only supported for V-JEPA2 models.")
-        if args.vjepa2_head != 'attentive':
-            raise ValueError("Multi-task training requires the attentive V-JEPA2 head.")
+        if args.vjepa2_head not in ('attentive', 'temporal_attentive'):
+            raise ValueError("Multi-task training requires the attentive or temporal_attentive V-JEPA2 head.")
         train_csv = args.ek100_train_csv
         if not os.path.exists(train_csv):
             train_csv = args.metadata_train
             if dist_utils.is_main_process():
                 print(f"=> Using metadata_train for label maps: {train_csv}")
-        label_maps = build_ek100_multitask_label_maps(train_csv)
+        val_csv = args.ek100_val_csv
+        if not os.path.exists(val_csv):
+            val_csv = args.metadata_val
+            if dist_utils.is_main_process():
+                print(f"=> Using metadata_val for label maps: {val_csv}")
+        label_maps = build_ek100_multitask_label_maps(train_csv, val_csv)
+        action_to_verb, action_to_noun = build_ek100_action_component_tensors(label_maps)
         args.num_classes_action = len(label_maps["action"])
         args.num_classes_verb = len(label_maps["verb"])
         args.num_classes_noun = len(label_maps["noun"])
@@ -1872,6 +2000,10 @@ def main(args):
             "=> Multi-task classes (action/verb/noun): "
             f"{args.num_classes_action}/{args.num_classes_verb}/{args.num_classes_noun}"
         )
+        print(
+            "=> Compositional action fusion: "
+            f"alpha={args.composition_alpha} aux_weight={args.composition_aux_weight}"
+        )
     else:
         print(f"=> Number of classes: {args.num_classes}")
     
@@ -1891,10 +2023,13 @@ def main(args):
                         num_verb_classes=args.num_classes_verb,
                         num_noun_classes=args.num_classes_noun,
                         num_action_classes=args.num_classes_action,
+                        action_to_verb=action_to_verb,
+                        action_to_noun=action_to_noun,
                         probe_num_heads=args.probe_num_heads,
                         probe_num_blocks=args.probe_num_blocks,
                         probe_mlp_ratio=args.probe_mlp_ratio,
                         probe_dropout=args.probe_dropout,
+                        composition_alpha=args.composition_alpha,
                         use_activation_checkpointing=args.probe_use_activation_checkpointing,
                         freeze_encoder=not args.unfreeze_encoder,
                         pretrained_backbone=pretrained_backbone,
@@ -1905,10 +2040,13 @@ def main(args):
                         num_verb_classes=args.num_classes_verb,
                         num_noun_classes=args.num_classes_noun,
                         num_action_classes=args.num_classes_action,
+                        action_to_verb=action_to_verb,
+                        action_to_noun=action_to_noun,
                         probe_num_heads=args.probe_num_heads,
                         probe_num_blocks=args.probe_num_blocks,
                         probe_mlp_ratio=args.probe_mlp_ratio,
                         probe_dropout=args.probe_dropout,
+                        composition_alpha=args.composition_alpha,
                         use_activation_checkpointing=args.probe_use_activation_checkpointing,
                         freeze_encoder=not args.unfreeze_encoder,
                         pretrained_backbone=pretrained_backbone,
@@ -2251,10 +2389,13 @@ def main(args):
                     num_verb_classes=args.num_classes_verb,
                     num_noun_classes=args.num_classes_noun,
                     num_action_classes=args.num_classes_action,
+                    action_to_verb=action_to_verb,
+                    action_to_noun=action_to_noun,
                     num_heads=args.probe_num_heads,
                     depth=args.probe_num_blocks,
                     mlp_ratio=args.probe_mlp_ratio,
                     dropout=args.probe_dropout,
+                    composition_alpha=args.composition_alpha,
                     use_activation_checkpointing=args.probe_use_activation_checkpointing,
                 ).cuda(args.gpu)
                 for _ in opt_kwargs
