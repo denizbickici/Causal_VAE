@@ -1,0 +1,22 @@
+python3 main_extract_feature_vjepa_probe.py \
+  --dataset ek100_cls \
+  --task-type noun \
+  --vjepa2-head temporal_attentive \
+  --probe-num-blocks 4 \
+  --probe-num-heads 16 \
+  --metadata-train /scratch/users/bickici/data/EK100/meta_data/EPIC_100_train.csv \
+  --metadata-val /scratch/users/bickici/data/EK100/meta_data/EPIC_100_validation.csv \
+  --ek100-train-csv /scratch/users/bickici/data/EK100/meta_data/EPIC_100_train.csv \
+  --ek100-val-csv /scratch/users/bickici/data/EK100/meta_data/EPIC_100_validation.csv \
+  --root /scratch/users/bickici/data/EK100/EK100_256p \
+  --model-type vjepa2_1_vit_large_384 \
+  --resume /scratch/users/bickici/data/EK100/model_checkpoints/focal_probe_vjepa2_1_vit_large_384_ek100_cls_noun/checkpoint_best.pt \
+  --batch-size 8 \
+  --num-clips 1 \
+  --num-crops 1 \
+  --clip-length 16 \
+  --clip-stride 2 \
+  --use-timestamps \
+  --output-dir /scratch/users/bickici/data/EK100/vjepa_features/vjepa2_1_vit_large_384_ek100_probe_noun \
+  --seed 42 \
+  --workers 24

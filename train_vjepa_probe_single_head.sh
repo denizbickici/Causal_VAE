@@ -1,0 +1,29 @@
+python main_train_vjepa_probe.py \
+  --dataset ek100_cls \
+  --root /scratch/users/bickici/data/EK100/EK100_256p \
+  --metadata-train /scratch/users/bickici/data/EK100/meta_data/EPIC_100_train.csv \
+  --metadata-val /scratch/users/bickici/data/EK100/meta_data/EPIC_100_validation.csv \
+  --ek100-train-csv /scratch/users/bickici/data/EK100/meta_data/EPIC_100_train.csv \
+  --ek100-val-csv /scratch/users/bickici/data/EK100/meta_data/EPIC_100_validation.csv \
+  --output-dir /scratch/users/bickici/data/EK100/model_checkpoints/focal_probe_vjepa2_1_vit_large_384_ek100_cls_multitask \
+  --model-type vjepa2_1_vit_large_384 \
+  --task-type action \
+  --batch-size 8 \
+  --lr 3e-4 \
+  --wd 0.01 \
+  --epochs 50 \
+  --warmup-epochs 5 \
+  --eval-freq 1 \
+  --save-freq 1 \
+  --num-clips 1 \
+  --num-crops 1 \
+  --clip-length 16 \
+  --clip-stride 2 \
+  --workers 24 \
+  --seed 42 \
+  --use-focal-loss \
+  --print-freq 100 \
+  --use-timestamps \
+  --multi-task \
+  --probe-num-blocks 4 \
+  --probe-num-heads 16
