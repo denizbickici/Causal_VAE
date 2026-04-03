@@ -1,0 +1,23 @@
+python3 main_extract_feature.py \
+  --dataset ek100_cls \
+  --metadata-train /scratch/users/bickici/data/EK100/meta_data/EPIC_100_train.csv \
+  --metadata-val /scratch/users/bickici/data/EK100/meta_data/EPIC_100_validation.csv \
+  --root /scratch/users/bickici/data/EK100/EK100_256p \
+  --pretrain-model /home/bickicdz/projects/Causal_VAE/slurm/train/lavila/clip_openai_timesformer_large.narrator_rephraser.ep_0003.md5sum_c89337.pth \
+  --batch-size 32 \
+  --use-sgd \
+  --wd 4e-5 \
+  --output-dir /scratch/users/bickici/data/lavila_new \
+  --egtea_finetune_type action \
+  --model_type lavila \
+  --num-clips 1 \
+  --num-crops 1 \
+  --clip-length 16 \
+  --clip-stride 2 \
+  --workers 24 \
+  --seed 42 \
+  --use-checkpoint \
+  --use-vn-classifier \
+  --num-classes 97 300 3806 \
+  --use-timestamps \
+  --resume /home/bickicdz/projects/Causal_VAE/slurm/train/lavila/clip_openai_timesformer_large.ft_ek100_cls.ep_0090.md5sum_4a2509.pth
