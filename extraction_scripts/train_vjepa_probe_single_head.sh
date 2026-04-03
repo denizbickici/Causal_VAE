@@ -5,9 +5,10 @@ python main_train_vjepa_probe.py \
   --metadata-val /scratch/users/bickici/data/EK100/meta_data/EPIC_100_validation.csv \
   --ek100-train-csv /scratch/users/bickici/data/EK100/meta_data/EPIC_100_train.csv \
   --ek100-val-csv /scratch/users/bickici/data/EK100/meta_data/EPIC_100_validation.csv \
-  --output-dir /scratch/users/bickici/data/EK100/model_checkpoints/focal_probe_vjepa2_1_vit_large_384_ek100_cls_multitask \
+  --output-dir /scratch/users/bickici/data/EK100/model_checkpoints/focal_probe_vjepa2_1_vit_large_384_ek100_cls_verb \ # change dir per task
   --model-type vjepa2_1_vit_large_384 \
-  --task-type action \
+  --task-type verb \ # noun
+  --vjepa2-head temporal_attentive \
   --batch-size 8 \
   --lr 3e-4 \
   --wd 0.01 \
@@ -21,9 +22,6 @@ python main_train_vjepa_probe.py \
   --clip-stride 2 \
   --workers 24 \
   --seed 42 \
-  --use-focal-loss \
   --print-freq 100 \
-  --use-timestamps \
-  --multi-task \
-  --probe-num-blocks 4 \
-  --probe-num-heads 16
+  --use-focal-loss \
+  --use-timestamps
