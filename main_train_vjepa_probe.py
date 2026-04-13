@@ -1108,6 +1108,14 @@ def _append_valid_action_batch(outputs_store, targets_store, logits, target):
     return int(valid.sum().item())
 
 
+def _get_amp_config(args):
+    if args.disable_amp:
+        return False, torch.float16, False
+    if args.use_bfloat16:
+        return True, torch.bfloat16, False
+    return True, torch.float16, True
+
+
 def train(train_loader, model, flow_model, criterion, optimizer, scaler, epoch, lr_schedule, args):
     """Training function"""
     batch_time = AverageMeter('Time', ':6.2f')
@@ -1131,7 +1139,8 @@ def train(train_loader, model, flow_model, criterion, optimizer, scaler, epoch, 
 
     iters_per_epoch = len(train_loader)
     progress = ProgressMeter(iters_per_epoch, meters, prefix="Epoch: [{}]".format(epoch))
-    
+    amp_enabled, amp_dtype, _ = _get_amp_config(args)
+
     # Switch to train mode
     model.train()
     
@@ -1191,7 +1200,7 @@ def train(train_loader, model, flow_model, criterion, optimizer, scaler, epoch, 
             model_input = images
         
         # Forward pass
-        with amp.autocast(enabled=not args.disable_amp):
+        with amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
             output = model(model_input)
             if args.multi_task:
                 loss_verb = criterion["verb"](output["verb"], verb_target)
@@ -1575,7 +1584,8 @@ def validate(val_loader, model, flow_model, args):
         top5 = AverageMeter('Acc@5', ':6.2f')
         meters = [batch_time, top1, top5]
     progress = ProgressMeter(len(val_loader), meters, prefix='Test: ')
-    
+    amp_enabled, amp_dtype, _ = _get_amp_config(args)
+
     # Switch to evaluate mode
     model.eval()
     
@@ -1623,7 +1633,8 @@ def validate(val_loader, model, flow_model, args):
                             batch_size, num_frames, 2, 224, 224)
                         flow_input = flow_normalized.permute(0, 2, 1, 3, 4)
                         
-                        logit = model(flow_input)
+                        with amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                            logit = model(flow_input)
                         logit_allcrops.append(logit)
                     
                     # Average predictions across crops
@@ -1656,7 +1667,8 @@ def validate(val_loader, model, flow_model, args):
                         batch_size, num_frames, 2, 224, 224)
                     flow_input = flow_normalized.permute(0, 2, 1, 3, 4)
                     
-                    output = model(flow_input)
+                    with amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                        output = model(flow_input)
                 
             else:  # RGB models (MViT spatial or V-JEPA2)
                 if args.multi_task:
@@ -1669,7 +1681,8 @@ def validate(val_loader, model, flow_model, args):
                     logit_allcrops = []
                     for crop in images:
                         crop = crop.cuda(args.gpu, non_blocking=True)
-                        logit = model(crop)
+                        with amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                            logit = model(crop)
                         logit_allcrops.append(logit)
                     if args.multi_task:
                         output = _average_multitask_logits(logit_allcrops)
@@ -1678,7 +1691,8 @@ def validate(val_loader, model, flow_model, args):
                 else:
                     # Single crop
                     images = images.cuda(args.gpu, non_blocking=True)
-                    output = model(images)
+                    with amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                        output = model(images)
 
             if args.multi_task:
                 verb_target = verb_target.cuda(args.gpu, non_blocking=True)
@@ -1985,7 +1999,13 @@ def main(args):
             optimizer = torch.optim.AdamW(parameters, lr=args.lr, betas=args.betas, eps=args.eps, weight_decay=args.wd)
 
         # Create gradient scaler for mixed precision
-        scaler = amp.GradScaler(enabled=not args.disable_amp)
+        amp_enabled, amp_dtype, scaler_enabled = _get_amp_config(args)
+        scaler = amp.GradScaler(enabled=scaler_enabled)
+        if amp_enabled:
+            amp_name = "bfloat16" if amp_dtype == torch.bfloat16 else "float16"
+            print(f"=> Using autocast with {amp_name}")
+        else:
+            print("=> AMP disabled")
 
         # Resume from checkpoint
         best_acc1 = 0.
@@ -2008,8 +2028,12 @@ def main(args):
 
                 if 'optimizer' in checkpoint:
                     optimizer.load_state_dict(checkpoint['optimizer'])
-                if 'scaler' in checkpoint:
-                    scaler.load_state_dict(checkpoint['scaler'])
+                saved_scaler = checkpoint.get('scaler')
+                if saved_scaler:
+                    if scaler.is_enabled():
+                        scaler.load_state_dict(saved_scaler)
+                    else:
+                        print("=> Skipping saved GradScaler state for current precision mode.")
                 best_acc1 = checkpoint.get('best_acc1', 0.)
                 print(f"=> Loaded checkpoint (epoch {checkpoint['epoch']})")
             else:
