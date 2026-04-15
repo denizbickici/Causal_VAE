@@ -60,26 +60,75 @@ VJEPA2_MODEL_SPECS = {
 	'vjepa2_1_vit_gigantic_384': {'hub_name': 'vjepa2_1_vit_gigantic_384', 'crop_size': 384, 'repo_dir': 'vjepa2.1'},
 }
 VJEPA2_MOTION_LAYERS_1BASED = [25, 27, 29, 31]
+VJEPA2_HIERARCHICAL_MOTION_MODELS = {
+	'vjepa2_1_vit_giant_384',
+	'vjepa2_1_vit_gigantic_384',
+}
 
 
-def _get_motion_layer_indices(encoder):
-	motion_layers = [idx - 1 for idx in VJEPA2_MOTION_LAYERS_1BASED]
+def _validate_motion_layer_indices(encoder, motion_layers, layer_source):
+	if motion_layers is None:
+		return None
+	if len(motion_layers) == 0:
+		raise ValueError(f"{layer_source} motion layer list is empty.")
 	if hasattr(encoder, "get_num_layers"):
 		num_layers = encoder.get_num_layers()
-		if max(motion_layers) >= num_layers:
+		if min(motion_layers) < 0 or max(motion_layers) >= num_layers:
 			raise ValueError(
-				f"Motion layers {motion_layers} exceed encoder depth {num_layers}; "
-				"adjust VJEPA2_MOTION_LAYERS_1BASED for this backbone."
+				f"{layer_source} motion layers {motion_layers} exceed encoder depth {num_layers}."
+			)
+	hierarchical_layers = list(getattr(encoder, "hierarchical_layers", []) or [])
+	if hierarchical_layers:
+		invalid = [layer for layer in motion_layers if layer not in hierarchical_layers]
+		if invalid:
+			raise ValueError(
+				f"{layer_source} motion layers {motion_layers} are incompatible with encoder hierarchical "
+				f"layers {hierarchical_layers}; invalid layers: {invalid}"
 			)
 	return motion_layers
 
 
-def _supports_motion_features(encoder):
+def _resolve_motion_layer_indices(encoder, model_type: str, motion_layer_set: str = "auto"):
+	motion_layer_set = (motion_layer_set or "auto").lower()
+	hierarchical_layers = list(getattr(encoder, "hierarchical_layers", []) or [])
+	legacy_layers = [idx - 1 for idx in VJEPA2_MOTION_LAYERS_1BASED]
+
+	if motion_layer_set == "none":
+		return None
+	if motion_layer_set == "legacy":
+		return _validate_motion_layer_indices(encoder, legacy_layers, "Legacy")
+	if motion_layer_set == "hierarchical":
+		if not hierarchical_layers:
+			raise ValueError(
+				f"Encoder for {model_type} does not expose hierarchical_layers; cannot use "
+				"--vjepa2-motion-layer-set hierarchical."
+			)
+		return _validate_motion_layer_indices(encoder, hierarchical_layers, "Hierarchical")
+	if motion_layer_set != "auto":
+		raise ValueError(
+			f"Unsupported motion layer set '{motion_layer_set}'. "
+			"Choose from: auto, legacy, hierarchical, none."
+		)
+
+	try:
+		return _validate_motion_layer_indices(encoder, legacy_layers, "Legacy")
+	except ValueError as exc:
+		if model_type in VJEPA2_HIERARCHICAL_MOTION_MODELS and hierarchical_layers:
+			print(
+				f"=> Switching {model_type} motion extraction to hierarchical layers "
+				f"{hierarchical_layers} because legacy layers are incompatible ({exc})."
+			)
+			return _validate_motion_layer_indices(encoder, hierarchical_layers, "Hierarchical")
+		return None
+
+
+def _supports_motion_features(encoder, model_type: str, motion_layer_set: str = "auto"):
 	if not hasattr(encoder, "out_layers"):
 		return False
-	if hasattr(encoder, "get_num_layers"):
-		return max(idx - 1 for idx in VJEPA2_MOTION_LAYERS_1BASED) < encoder.get_num_layers()
-	return True
+	try:
+		return _resolve_motion_layer_indices(encoder, model_type, motion_layer_set) is not None
+	except ValueError:
+		return False
 
 
 def _get_vjepa2_repo_root(variant_key: str):
@@ -632,11 +681,12 @@ def extract_probe_temporal_features(pooler: nn.Module, token_feats: torch.Tensor
 	return {name: pooled[:, :, idx, :] for idx, name in enumerate(head_names)}
 
 
-def extract_motion_features(encoder: nn.Module, inputs: torch.Tensor, clip_length: int):
+def extract_motion_features(encoder: nn.Module, inputs: torch.Tensor, clip_length: int, motion_layers=None):
 	"""Extract concatenated motion-layer tokens and pool spatially to [B, T, D]."""
 	if not hasattr(encoder, "out_layers"):
 		raise RuntimeError("Encoder does not expose out_layers for intermediate extraction.")
-	motion_layers = _get_motion_layer_indices(encoder)
+	if motion_layers is None:
+		raise RuntimeError("Motion layer indices must be resolved before extracting motion features.")
 	prev_out_layers = encoder.out_layers
 	encoder.out_layers = motion_layers
 	try:
@@ -884,8 +934,18 @@ def forward_with_features(model, model_type, activation, inputs, args):
 			if temporal_probe_feat is None and getattr(args, 'vjepa2_head', 'attentive') == 'attentive' and hasattr(model_without_ddp, 'probe'):
 				pooler = getattr(model_without_ddp.probe, 'pooler', None)
 				temporal_probe_feat = extract_probe_temporal_features(pooler, tokens, token_temporal_length)
-		if _supports_motion_features(encoder):
-			verb_input_feat = extract_motion_features(encoder, inputs, token_temporal_length)
+			motion_layers = _resolve_motion_layer_indices(
+				encoder,
+				model_type,
+				getattr(args, 'vjepa2_motion_layer_set', 'auto'),
+			)
+			if motion_layers is not None:
+				verb_input_feat = extract_motion_features(
+					encoder,
+					inputs,
+					token_temporal_length,
+					motion_layers=motion_layers,
+				)
 	else:
 		logits = model(inputs)
 		token_output = activation['tokens']
@@ -1181,6 +1241,9 @@ def get_args_parser():
 						help='dropout before classifier in probe head (V-JEPA2)')
 	parser.add_argument('--probe-use-activation-checkpointing', action='store_true',
 						help='enable activation checkpointing in attentive probe')
+	parser.add_argument('--vjepa2-motion-layer-set', default='auto', type=str,
+						choices=['auto', 'legacy', 'hierarchical', 'none'],
+						help='layer selection for optional verb_input_feats extraction; auto keeps legacy behavior except giant/gigantic V-JEPA2.1 backbones switch to hierarchical layers')
 
 	# System
 	parser.add_argument('--print-freq', default=50, type=int, help='print frequency')
